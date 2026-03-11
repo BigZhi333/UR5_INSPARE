@@ -1,0 +1,101 @@
+{
+  "task_name": "fr5_rh56e2_sugar_box_low_level",
+  "object_id": 3,
+  "object_name": "004_sugar_box",
+  "object_dims_m": [
+    0.038,
+    0.089,
+    0.175
+  ],
+  "object_mass_kg": 0.514,
+  "table_center": [
+    0.68,
+    -0.32,
+    0.25
+  ],
+  "table_size": [
+    0.62,
+    0.85,
+    0.25
+  ],
+  "table_friction": [
+    1.0,
+    0.02,
+    0.002
+  ],
+  "default_object_pose": [
+    0.62,
+    -0.54,
+    0.5875,
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "workspace_translation": [
+    0.08,
+    -0.74,
+    0.03
+  ],
+  "control_dt": 0.03,
+  "frame_skip": 13,
+  "pre_grasp_steps": 60,
+  "hold_steps": 135,
+  "num_envs": 8,
+  "action_delta_arm": 0.035,
+  "action_delta_wrist_pos_m": 0.012,
+  "action_delta_wrist_rot_rad": 0.12,
+  "action_delta_hand": 0.05,
+  "joint_noise_std": 0.03,
+  "pregrasp_backoff_m": 0.08,
+  "pregrasp_lift_m": 0.02,
+  "reward_clip": -2.0,
+  "reward": {
+    "site_reward": 2.0,
+    "pose_reward": 0.1,
+    "contact_reward": 1.0,
+    "impulse_reward": 2.0,
+    "falling_reward": 1.0,
+    "rel_obj_reward": -1.0,
+    "body_vel_reward": -0.5,
+    "body_qvel_reward": -0.5,
+    "wrist_pose_reward": 1.0,
+    "wrist_align_reward": 0.5,
+    "penetration_reward": -0.75,
+    "action_rate": -0.01
+  },
+  "ppo": {
+    "hidden_sizes": [
+      128,
+      128
+    ],
+    "gamma": 0.996,
+    "gae_lambda": 0.95,
+    "clip_ratio": 0.2,
+    "learning_rate": 0.0005,
+    "entropy_coef": 0.0,
+    "value_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "desired_kl": 0.01,
+    "epochs": 4,
+    "minibatches": 4,
+    "train_updates": 200,
+    "save_every": 10
+  },
+  "eval": {
+    "num_episodes": 20,
+    "drop_table_after_pregrasp": true,
+    "success_height_threshold_m": 0.1,
+    "save_trajectories": true
+  },
+  "conversion": {
+    "wrist_error_threshold_m": 0.015,
+    "wrist_rot_threshold_deg": 10.0,
+    "site_rmse_threshold_m": 0.02,
+    "min_valid_goals": 10,
+    "arm_ik_iterations": 120,
+    "arm_ik_damping": 0.0005,
+    "finger_opt_max_nfev": 80,
+    "joint_opt_max_nfev": 100
+  }
+}

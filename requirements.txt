@@ -1,0 +1,11 @@
+# Install PyTorch separately based on your CPU/CUDA target.
+# Example for CUDA builds: https://pytorch.org/get-started/locally/
+
+numpy==2.2.6
+scipy==1.15.3
+mujoco==3.4.0
+gymnasium==1.2.3
+joblib==1.5.3
+tensorboard==2.20.0
+Pillow==12.1.0
+

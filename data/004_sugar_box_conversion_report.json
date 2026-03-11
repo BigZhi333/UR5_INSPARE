@@ -1,0 +1,146 @@
+[
+  {
+    "label_idx": 0,
+    "status": "rejected",
+    "wrist_error_m": 0.04528450711369001,
+    "wrist_rot_error_deg": 5.604092054727908,
+    "site_rmse_m": 0.052400883815891496,
+    "optimizer_cost": 0.011001134573986304
+  },
+  {
+    "label_idx": 1,
+    "status": "rejected",
+    "wrist_error_m": 0.02202732045590781,
+    "wrist_rot_error_deg": 3.54219220031972,
+    "site_rmse_m": 0.03763070124780931,
+    "optimizer_cost": 0.005678276985297328
+  },
+  {
+    "label_idx": 2,
+    "status": "rejected",
+    "wrist_error_m": 0.026481104064415954,
+    "wrist_rot_error_deg": 4.223365212085693,
+    "site_rmse_m": 0.033254364514238625,
+    "optimizer_cost": 0.004731298698308574
+  },
+  {
+    "label_idx": 3,
+    "status": "rejected",
+    "wrist_error_m": 0.03022558734721319,
+    "wrist_rot_error_deg": 4.137701537858921,
+    "site_rmse_m": 0.036237890192064345,
+    "optimizer_cost": 0.005758396818084617
+  },
+  {
+    "label_idx": 4,
+    "status": "rejected",
+    "wrist_error_m": 0.05416709598774238,
+    "wrist_rot_error_deg": 4.230836499652492,
+    "site_rmse_m": 0.05216473975466674,
+    "optimizer_cost": 0.012776725017303914
+  },
+  {
+    "label_idx": 5,
+    "status": "rejected",
+    "wrist_error_m": 0.04145868616971119,
+    "wrist_rot_error_deg": 5.2615737374557785,
+    "site_rmse_m": 0.041451083255174416,
+    "optimizer_cost": 0.00794305804889296
+  },
+  {
+    "label_idx": 6,
+    "status": "rejected",
+    "wrist_error_m": 0.05531824302764972,
+    "wrist_rot_error_deg": 5.350641925469317,
+    "site_rmse_m": 0.05249478364823712,
+    "optimizer_cost": 0.011049502530415157
+  },
+  {
+    "label_idx": 7,
+    "status": "rejected",
+    "wrist_error_m": 0.061341584450735495,
+    "wrist_rot_error_deg": 5.680918232741803,
+    "site_rmse_m": 0.05155177582988706,
+    "optimizer_cost": 0.012098144321417604
+  },
+  {
+    "label_idx": 8,
+    "status": "rejected",
+    "wrist_error_m": 0.07517238624949801,
+    "wrist_rot_error_deg": 8.134042077831502,
+    "site_rmse_m": 0.051369085236718404,
+    "optimizer_cost": 0.013539091264434793
+  },
+  {
+    "label_idx": 9,
+    "status": "rejected",
+    "wrist_error_m": 0.03966440746584805,
+    "wrist_rot_error_deg": 5.509432579115454,
+    "site_rmse_m": 0.0531231240716128,
+    "optimizer_cost": 0.011088739854427973
+  },
+  {
+    "label_idx": 10,
+    "status": "rejected",
+    "wrist_error_m": 0.0491075916719236,
+    "wrist_rot_error_deg": 5.675260325372212,
+    "site_rmse_m": 0.05358888215248637,
+    "optimizer_cost": 0.011958747252829804
+  },
+  {
+    "label_idx": 11,
+    "status": "rejected",
+    "wrist_error_m": 0.03271884733883732,
+    "wrist_rot_error_deg": 4.31413644742402,
+    "site_rmse_m": 0.0394217078008731,
+    "optimizer_cost": 0.006691846692187024
+  },
+  {
+    "label_idx": 12,
+    "status": "rejected",
+    "wrist_error_m": 0.05860235934621395,
+    "wrist_rot_error_deg": 4.8396774543759316,
+    "site_rmse_m": 0.05042949032189307,
+    "optimizer_cost": 0.0105167209232748
+  },
+  {
+    "label_idx": 13,
+    "status": "rejected",
+    "wrist_error_m": 0.031243995527478224,
+    "wrist_rot_error_deg": 4.768299659087972,
+    "site_rmse_m": 0.038745568040077887,
+    "optimizer_cost": 0.0077250438604280994
+  },
+  {
+    "label_idx": 14,
+    "status": "rejected",
+    "wrist_error_m": 0.04899083720326498,
+    "wrist_rot_error_deg": 7.3251532026982895,
+    "site_rmse_m": 0.05611675250331607,
+    "optimizer_cost": 0.012703078787783642
+  },
+  {
+    "label_idx": 15,
+    "status": "rejected",
+    "wrist_error_m": 0.05447386556931209,
+    "wrist_rot_error_deg": 6.399233908606826,
+    "site_rmse_m": 0.04590338903748131,
+    "optimizer_cost": 0.01065132414730763
+  },
+  {
+    "label_idx": 16,
+    "status": "rejected",
+    "wrist_error_m": 0.047584982986131494,
+    "wrist_rot_error_deg": 5.841191025759697,
+    "site_rmse_m": 0.053108005758047534,
+    "optimizer_cost": 0.011226656048119203
+  },
+  {
+    "label_idx": 17,
+    "status": "rejected",
+    "wrist_error_m": 0.027597591946499127,
+    "wrist_rot_error_deg": 3.9614593723741915,
+    "site_rmse_m": 0.039687627493881224,
+    "optimizer_cost": 0.006896076772975344
+  }
+]
