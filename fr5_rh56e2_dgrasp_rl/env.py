@@ -243,32 +243,70 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         action_rate_term = float(np.mean((action - self.previous_action) ** 2))
 
         weights = self.config.reward
-        reward = (
-            weights["site_reward"] * site_term
-            + weights["pose_reward"] * pose_term
-            + weights["contact_reward"] * contact_term
-            + weights["impulse_reward"] * impulse_term
-            + weights["falling_reward"] * falling_term
-            + weights["rel_obj_reward"] * rel_obj_term
-            + weights["body_vel_reward"] * body_vel_term
-            + weights["body_qvel_reward"] * body_qvel_term
-            + weights.get("wrist_pose_reward", 0.0) * wrist_pose_term
-            + weights["wrist_align_reward"] * wrist_align_term
-            + weights.get("penetration_reward", 0.0) * penetration_term
-            + weights["action_rate"] * action_rate_term
+        reward_site = weights["site_reward"] * site_term
+        reward_pose = weights["pose_reward"] * pose_term
+        reward_contact = weights["contact_reward"] * contact_term
+        reward_impulse = weights["impulse_reward"] * impulse_term
+        reward_falling = weights["falling_reward"] * falling_term
+        reward_rel_obj = weights["rel_obj_reward"] * rel_obj_term
+        reward_body_vel = weights["body_vel_reward"] * body_vel_term
+        reward_body_qvel = weights["body_qvel_reward"] * body_qvel_term
+        reward_wrist_pose = weights.get("wrist_pose_reward", 0.0) * wrist_pose_term
+        reward_wrist_align = weights["wrist_align_reward"] * wrist_align_term
+        reward_penetration = weights.get("penetration_reward", 0.0) * penetration_term
+        reward_action_rate = weights["action_rate"] * action_rate_term
+
+        reward_preclip = (
+            reward_site
+            + reward_pose
+            + reward_contact
+            + reward_impulse
+            + reward_falling
+            + reward_rel_obj
+            + reward_body_vel
+            + reward_body_qvel
+            + reward_wrist_pose
+            + reward_wrist_align
+            + reward_penetration
+            + reward_action_rate
         )
-        reward = float(max(reward, self.config.reward_clip))
+        reward = float(max(reward_preclip, self.config.reward_clip))
 
         reward_info = {
             "wrist_translation_error_m": wrist_translation_error,
             "wrist_rotation_error_deg": wrist_rotation_error_deg,
             "site_rmse_m": semantic_site_rmse,
             "hand_pose_error": hand_pose_error,
+            "term_site": site_term,
+            "term_pose": pose_term,
+            "term_wrist_pose": wrist_pose_term,
+            "term_wrist_align": wrist_align_term,
             "contact_term": contact_term,
             "contact_bit_match": contact_bit_match,
             "matched_positive_contacts": matched_positive,
             "false_positive_contacts": false_positive,
             "impulse_term": impulse_term,
+            "term_falling": falling_term,
+            "term_rel_obj": rel_obj_term,
+            "term_body_vel": body_vel_term,
+            "term_body_qvel": body_qvel_term,
+            "term_penetration": penetration_term,
+            "term_action_rate": action_rate_term,
+            "reward_site": reward_site,
+            "reward_pose": reward_pose,
+            "reward_wrist_pose": reward_wrist_pose,
+            "reward_wrist_align": reward_wrist_align,
+            "reward_contact": reward_contact,
+            "reward_impulse": reward_impulse,
+            "reward_falling": reward_falling,
+            "reward_rel_obj": reward_rel_obj,
+            "reward_body_vel": reward_body_vel,
+            "reward_body_qvel": reward_body_qvel,
+            "reward_penetration": reward_penetration,
+            "reward_action_rate": reward_action_rate,
+            "reward_preclip": reward_preclip,
+            "reward_total": reward,
+            "reward_clip_delta": reward - reward_preclip,
             "penetration_m": float(contact_diag["total_penetration_m"]),
             "max_penetration_m": float(contact_diag["max_penetration_m"]),
             "falling_term": falling_term,
@@ -356,7 +394,9 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         obs = self._observation()
 
         terminated = False
-        truncated = self.step_count >= self.config.total_episode_steps or (self.table_dropped and self.slipped)
+        # Keep the episode length fixed like the original D-Grasp setup.
+        # Slip only affects reward/success metrics and no longer ends the episode early.
+        truncated = self.step_count >= self.config.total_episode_steps
         info = {
             **reward_info,
             "goal_index": self.current_goal_index,

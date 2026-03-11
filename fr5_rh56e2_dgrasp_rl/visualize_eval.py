@@ -50,10 +50,12 @@ def _phase_name(env: FR5LowLevelGraspEnv) -> str:
 def _end_reason(env: FR5LowLevelGraspEnv, done: bool) -> str:
     if not done:
         return "running"
+    if env.step_count >= env.config.total_episode_steps:
+        if env.slipped:
+            return "time_limit_slipped"
+        return "time_limit"
     if env.table_dropped and env.slipped:
         return "slipped_after_drop"
-    if env.step_count >= env.config.total_episode_steps:
-        return "time_limit"
     return "terminated"
 
 
