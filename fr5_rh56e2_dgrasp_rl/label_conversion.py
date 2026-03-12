@@ -20,6 +20,7 @@ from .semantics import (
 )
 from .task_config import TaskConfig
 from .utils import rotation_angle_deg, transform_points
+from .pose_driven_data import wrist_pose_from_semantic_sites
 
 
 def _xyzw_pose_to_wxyz(pose: np.ndarray) -> np.ndarray:
@@ -62,7 +63,7 @@ def _optimize_goal_qpos(
 
     arm_qpos = solve_arm_wrist_palm_ik(
         runtime=runtime,
-        target_sites_world=target_sites_world,
+        target_wrist_pose_world=wrist_pose_from_semantic_sites(target_sites_world),
         initial_arm_qpos=arm_guess,
         hand_qpos=np.zeros_like(hand_guess),
         iterations=config.conversion.arm_ik_iterations,

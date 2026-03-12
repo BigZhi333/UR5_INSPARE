@@ -23,6 +23,7 @@ from .semantics import (
 )
 from .task_config import TaskConfig
 from .utils import (
+    apply_local_pose_delta,
     compose_pose7,
     inverse_pose7,
     matrix_to_pose7,
@@ -32,7 +33,15 @@ from .utils import (
     transform_points,
 )
 
-PROJECTION_SETTLE_STEPS = 32
+PROJECTION_SETTLE_STEPS = 48
+PROJECTION_SOFT_MAX_PENETRATION_M = 0.0035
+PROJECTION_SOFT_TOTAL_PENETRATION_M = 0.0080
+PROJECTION_SOFT_OBJECT_TRANSLATION_DRIFT_M = 0.040
+PROJECTION_SOFT_OBJECT_ROTATION_DRIFT_DEG = 12.0
+PROJECTION_HARD_MAX_PENETRATION_M = 0.0045
+PROJECTION_HARD_TOTAL_PENETRATION_M = 0.0100
+PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M = 0.050
+PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG = 18.0
 
 
 @dataclass
@@ -48,6 +57,10 @@ class PoseDrivenSample:
     semantic_sites_goal_world_21: list[float]
     semantic_sites_goal_object_21: list[float]
     source_contact_mask_12: list[float]
+    physical_contact_mask_12: list[float]
+    proximity_contact_mask_12: list[float]
+    contact_proximity_score_12: list[float]
+    contact_distance_12_m: list[float]
     contact_mask_12: list[float]
     valid_execution: bool
     fit_error: dict[str, float]
@@ -65,6 +78,10 @@ class PoseDrivenSample:
             "semantic_sites_goal_world_21": self.semantic_sites_goal_world_21,
             "semantic_sites_goal_object_21": self.semantic_sites_goal_object_21,
             "source_contact_mask_12": self.source_contact_mask_12,
+            "physical_contact_mask_12": self.physical_contact_mask_12,
+            "proximity_contact_mask_12": self.proximity_contact_mask_12,
+            "contact_proximity_score_12": self.contact_proximity_score_12,
+            "contact_distance_12_m": self.contact_distance_12_m,
             "contact_mask_12": self.contact_mask_12,
             "valid_execution": self.valid_execution,
             "fit_error": self.fit_error,
@@ -92,6 +109,18 @@ class PoseDrivenSample:
             ]
         if source_contact_mask_12 is None:
             source_contact_mask_12 = contact_mask_12
+        physical_contact_mask_12 = payload.get("physical_contact_mask_12")
+        if physical_contact_mask_12 is None:
+            physical_contact_mask_12 = contact_mask_12
+        proximity_contact_mask_12 = payload.get("proximity_contact_mask_12")
+        if proximity_contact_mask_12 is None:
+            proximity_contact_mask_12 = contact_mask_12
+        contact_proximity_score_12 = payload.get("contact_proximity_score_12")
+        if contact_proximity_score_12 is None:
+            contact_proximity_score_12 = contact_mask_12
+        contact_distance_12_m = payload.get("contact_distance_12_m")
+        if contact_distance_12_m is None:
+            contact_distance_12_m = [0.0 if float(v) > 0.5 else 1.0 for v in contact_mask_12]
         return cls(
             object_id=int(payload["object_id"]),
             label_idx=int(payload["label_idx"]),
@@ -104,6 +133,10 @@ class PoseDrivenSample:
             semantic_sites_goal_world_21=[float(v) for v in payload["semantic_sites_goal_world_21"]],
             semantic_sites_goal_object_21=[float(v) for v in payload["semantic_sites_goal_object_21"]],
             source_contact_mask_12=[float(v) for v in source_contact_mask_12],
+            physical_contact_mask_12=[float(v) for v in physical_contact_mask_12],
+            proximity_contact_mask_12=[float(v) for v in proximity_contact_mask_12],
+            contact_proximity_score_12=[float(v) for v in contact_proximity_score_12],
+            contact_distance_12_m=[float(v) for v in contact_distance_12_m],
             contact_mask_12=[float(v) for v in contact_mask_12],
             valid_execution=bool(payload["valid_execution"]),
             fit_error={str(k): float(v) for k, v in payload["fit_error"].items()},
@@ -245,6 +278,84 @@ def _finger_contact_bias_from_mask(source_contact_mask_12: np.ndarray) -> np.nda
     return squeeze - open_non_target
 
 
+def _required_target_contact_count(source_contact_mask_12: np.ndarray) -> int:
+    positive_contacts = int(np.sum(np.asarray(source_contact_mask_12, dtype=np.float64) > 0.5))
+    return min(2, positive_contacts)
+
+
+def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> tuple[float, ...]:
+    matched_contacts = float(candidate["source_matched_target_contacts"])
+    extra_contacts = float(candidate["source_extra_contacts"])
+    table_contact = 1.0 if bool(candidate["table_contact"]) else 0.0
+    max_penetration = float(candidate["max_penetration_m"])
+    total_penetration = float(candidate["total_penetration_m"])
+    object_translation_drift = float(candidate["object_translation_drift_m"])
+    object_rotation_drift = float(candidate["object_rotation_drift_deg"])
+
+    soft_penetration_over = max(0.0, max_penetration - PROJECTION_SOFT_MAX_PENETRATION_M)
+    soft_total_penetration_over = max(0.0, total_penetration - PROJECTION_SOFT_TOTAL_PENETRATION_M)
+    soft_translation_drift_over = max(0.0, object_translation_drift - PROJECTION_SOFT_OBJECT_TRANSLATION_DRIFT_M)
+    soft_rotation_drift_over = max(0.0, object_rotation_drift - PROJECTION_SOFT_OBJECT_ROTATION_DRIFT_DEG)
+    soft_safety_violation = (
+        10.0 * table_contact
+        + 600.0 * soft_penetration_over
+        + 120.0 * soft_total_penetration_over
+        + 80.0 * soft_translation_drift_over
+        + 2.0 * soft_rotation_drift_over
+    )
+    hard_penetration_over = max(0.0, max_penetration - PROJECTION_HARD_MAX_PENETRATION_M)
+    hard_total_penetration_over = max(0.0, total_penetration - PROJECTION_HARD_TOTAL_PENETRATION_M)
+    hard_translation_drift_over = max(0.0, object_translation_drift - PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M)
+    hard_rotation_drift_over = max(0.0, object_rotation_drift - PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG)
+    hard_safety_violation = (
+        10.0 * table_contact
+        + 600.0 * hard_penetration_over
+        + 120.0 * hard_total_penetration_over
+        + 80.0 * hard_translation_drift_over
+        + 2.0 * hard_rotation_drift_over
+    )
+    required_contact_shortfall = max(0.0, float(required_contacts) - matched_contacts)
+
+    if hard_safety_violation <= 1e-9:
+        return (
+            0.0,
+            required_contact_shortfall,
+            soft_safety_violation,
+            -matched_contacts,
+            extra_contacts,
+            float(candidate["source_site_rmse_m"]),
+            float(candidate["source_semantic_frame_error_deg"]),
+            object_translation_drift,
+            max_penetration,
+            float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
+            float(np.linalg.norm(np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64))),
+        )
+    return (
+        1.0,
+        hard_safety_violation,
+        required_contact_shortfall,
+        soft_safety_violation,
+        -matched_contacts,
+        extra_contacts,
+        float(candidate["source_site_rmse_m"]),
+        float(candidate["source_semantic_frame_error_deg"]),
+        object_translation_drift,
+        max_penetration,
+        float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
+        float(np.linalg.norm(np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64))),
+    )
+
+
+def _is_better_projected_candidate(
+    candidate: dict[str, Any],
+    incumbent: dict[str, Any] | None,
+    required_contacts: int,
+) -> bool:
+    if incumbent is None:
+        return True
+    return _projection_rank_key(candidate, required_contacts) < _projection_rank_key(incumbent, required_contacts)
+
+
 def _evaluate_projected_candidate(
     runtime: RobotSceneModel,
     config: TaskConfig,
@@ -253,18 +364,23 @@ def _evaluate_projected_candidate(
     source_semantic_sites_world: np.ndarray,
     source_contact_mask_12: np.ndarray,
     wrist_translation_local: np.ndarray,
+    wrist_rotvec_local: np.ndarray,
     hand_qpos: np.ndarray,
 ) -> dict[str, Any]:
+    wrist_translation_local = np.asarray(wrist_translation_local, dtype=np.float64)
+    wrist_rotvec_local = np.asarray(wrist_rotvec_local, dtype=np.float64)
     source_wrist_pose_world = np.asarray(source_wrist_pose_world, dtype=np.float64)
     source_frame = quat_wxyz_to_matrix(source_wrist_pose_world[3:])
-    wrist_translation_local = np.asarray(wrist_translation_local, dtype=np.float64)
-    candidate_wrist_pose = source_wrist_pose_world.copy()
-    candidate_wrist_pose[:3] = candidate_wrist_pose[:3] + source_frame @ wrist_translation_local
+    candidate_wrist_pose = apply_local_pose_delta(
+        source_wrist_pose_world,
+        wrist_translation_local,
+        wrist_rotvec_local,
+    )
     candidate_hand_qpos = runtime.clamp_hand(np.asarray(hand_qpos, dtype=np.float64))
 
     candidate_arm_qpos = solve_arm_wrist_palm_ik(
         runtime=runtime,
-        target_sites_world=wrist_pose_to_target_sites(candidate_wrist_pose),
+        target_wrist_pose_world=candidate_wrist_pose,
         initial_arm_qpos=runtime.home_actuated[:6],
         hand_qpos=candidate_hand_qpos,
         iterations=max(48, int(config.conversion.arm_ik_iterations * 0.6)),
@@ -274,33 +390,37 @@ def _evaluate_projected_candidate(
 
     runtime.reset()
     runtime.set_object_pose(object_pose_goal)
-    runtime.set_robot_actuated_qpos(target_actuated_qpos)
-    kinematic_sites = runtime.get_semantic_sites_world()
-    kinematic_wrist_pose = wrist_pose_from_semantic_sites(kinematic_sites)
-    kinematic_frame = quat_wxyz_to_matrix(kinematic_wrist_pose[3:])
-
-    runtime.reset()
-    runtime.set_object_pose(object_pose_goal)
     runtime.settle_actuated_pose(target_actuated_qpos, PROJECTION_SETTLE_STEPS)
+    settled_actuated_qpos = runtime.get_actuated_qpos()
+    settled_sites = runtime.get_semantic_sites_world()
+    settled_wrist_pose = wrist_pose_from_semantic_sites(settled_sites)
+    settled_frame = quat_wxyz_to_matrix(settled_wrist_pose[3:])
     settled_contact_diag = runtime.get_contact_diagnostics_12()
-    settled_contact_mask = np.asarray(settled_contact_diag["mask"], dtype=np.float64)
+    settled_hard_contact_mask = np.asarray(settled_contact_diag["hard_mask"], dtype=np.float64)
+    settled_proximity_mask = np.asarray(settled_contact_diag["proximity_mask"], dtype=np.float64)
+    settled_contact_mask = np.asarray(settled_contact_diag["hybrid_mask"], dtype=np.float64)
+    settled_proximity_scores = np.asarray(settled_contact_diag["proximity_scores"], dtype=np.float64)
+    settled_contact_distances = np.asarray(settled_contact_diag["distances_m"], dtype=np.float64)
     settled_object_pose = runtime.get_object_pose()
     goal_object_frame = quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64))
     settled_object_frame = quat_wxyz_to_matrix(settled_object_pose[3:])
 
-    wrist_error = float(np.linalg.norm(kinematic_sites[0] - source_semantic_sites_world[0]))
-    palm_error = float(np.linalg.norm(kinematic_sites[1] - source_semantic_sites_world[1]))
+    wrist_error = float(np.linalg.norm(settled_sites[0] - source_semantic_sites_world[0]))
+    palm_error = float(np.linalg.norm(settled_sites[1] - source_semantic_sites_world[1]))
     tip_rmse = float(
-        np.sqrt(np.mean(np.sum((kinematic_sites[2:] - source_semantic_sites_world[2:]) ** 2, axis=1)))
+        np.sqrt(np.mean(np.sum((settled_sites[2:] - source_semantic_sites_world[2:]) ** 2, axis=1)))
     )
     site_rmse = float(
-        np.sqrt(np.mean(np.sum((kinematic_sites - source_semantic_sites_world) ** 2, axis=1)))
+        np.sqrt(np.mean(np.sum((settled_sites - source_semantic_sites_world) ** 2, axis=1)))
     )
-    frame_error_deg = float(rotation_angle_deg(kinematic_frame, source_frame))
+    frame_error_deg = float(rotation_angle_deg(settled_frame, source_frame))
     target_contact_misses = float(np.sum((source_contact_mask_12 > 0.5) & (settled_contact_mask < 0.5)))
     extra_contacts = float(np.sum((source_contact_mask_12 < 0.5) & (settled_contact_mask > 0.5)))
     matched_target_contacts = float(np.sum((source_contact_mask_12 > 0.5) & (settled_contact_mask > 0.5)))
+    required_contacts = _required_target_contact_count(source_contact_mask_12)
+    contact_shortfall = max(0.0, float(required_contacts) - matched_target_contacts)
     translation_norm = float(np.linalg.norm(wrist_translation_local))
+    rotation_norm = float(np.linalg.norm(wrist_rotvec_local))
     object_translation_drift_m = float(np.linalg.norm(settled_object_pose[:3] - np.asarray(object_pose_goal[:3], dtype=np.float64)))
     object_rotation_drift_deg = float(rotation_angle_deg(settled_object_frame, goal_object_frame))
 
@@ -308,11 +428,13 @@ def _evaluate_projected_candidate(
         site_rmse
         + 28.0 * float(settled_contact_diag["total_penetration_m"])
         + 48.0 * float(settled_contact_diag["max_penetration_m"])
-        + 0.018 * target_contact_misses
+        + 0.200 * contact_shortfall
+        + 0.030 * target_contact_misses
         + 0.010 * extra_contacts
-        - 0.004 * matched_target_contacts
+        - 0.020 * matched_target_contacts
         + 0.02 * float(bool(settled_contact_diag["table_contact"]))
         + 0.20 * translation_norm
+        + 0.05 * rotation_norm
         + 1.25 * object_translation_drift_m
         + 0.0008 * object_rotation_drift_deg
         + 0.01 * float(np.linalg.norm(candidate_hand_qpos - runtime.home_actuated[6:]))
@@ -322,12 +444,17 @@ def _evaluate_projected_candidate(
     return {
         "score": float(score),
         "wrist_translation_local": wrist_translation_local.copy(),
-        "arm_qpos": candidate_arm_qpos.copy(),
-        "hand_qpos": candidate_hand_qpos.copy(),
-        "semantic_sites_world": kinematic_sites.copy(),
-        "wrist_pose_world": kinematic_wrist_pose.copy(),
-        "object_pose_goal": np.asarray(object_pose_goal, dtype=np.float64).copy(),
+        "wrist_rotvec_local": wrist_rotvec_local.copy(),
+        "arm_qpos": settled_actuated_qpos[:6].copy(),
+        "hand_qpos": settled_actuated_qpos[6:].copy(),
+        "semantic_sites_world": settled_sites.copy(),
+        "wrist_pose_world": settled_wrist_pose.copy(),
+        "object_pose_goal": settled_object_pose.copy(),
         "contact_mask_12": settled_contact_mask.copy(),
+        "physical_contact_mask_12": settled_hard_contact_mask.copy(),
+        "proximity_contact_mask_12": settled_proximity_mask.copy(),
+        "contact_proximity_score_12": settled_proximity_scores.copy(),
+        "contact_distance_12_m": settled_contact_distances.copy(),
         "contact_forces_12": np.asarray(settled_contact_diag["forces"], dtype=np.float64).copy(),
         "table_contact": bool(settled_contact_diag["table_contact"]),
         "total_penetration_m": float(settled_contact_diag["total_penetration_m"]),
@@ -341,9 +468,90 @@ def _evaluate_projected_candidate(
         "source_contact_misses": target_contact_misses,
         "source_extra_contacts": extra_contacts,
         "source_matched_target_contacts": matched_target_contacts,
+        "required_target_contacts": float(required_contacts),
         "object_translation_drift_m": object_translation_drift_m,
         "object_rotation_drift_deg": object_rotation_drift_deg,
     }
+
+
+def _coordinate_descent_projected_candidate(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    object_pose_goal: np.ndarray,
+    source_wrist_pose_world: np.ndarray,
+    source_semantic_sites_world: np.ndarray,
+    source_contact_mask_12: np.ndarray,
+    best: dict[str, Any],
+    required_contacts: int,
+    translation_steps: np.ndarray,
+    rotation_steps: np.ndarray,
+    hand_steps: np.ndarray,
+    passes: int,
+) -> dict[str, Any]:
+    for _ in range(max(1, int(passes))):
+        improved = False
+
+        for axis in range(3):
+            for direction in (-1.0, 1.0):
+                candidate_translation = np.asarray(best["wrist_translation_local"], dtype=np.float64).copy()
+                candidate_translation[axis] += direction * translation_steps[axis]
+                candidate = _evaluate_projected_candidate(
+                    runtime=runtime,
+                    config=config,
+                    object_pose_goal=object_pose_goal,
+                    source_wrist_pose_world=source_wrist_pose_world,
+                    source_semantic_sites_world=source_semantic_sites_world,
+                    source_contact_mask_12=source_contact_mask_12,
+                    wrist_translation_local=candidate_translation,
+                    wrist_rotvec_local=np.asarray(best["wrist_rotvec_local"], dtype=np.float64),
+                    hand_qpos=np.asarray(best["hand_qpos"], dtype=np.float64),
+                )
+                if _is_better_projected_candidate(candidate, best, required_contacts):
+                    best = candidate
+                    improved = True
+
+        for axis in range(3):
+            for direction in (-1.0, 1.0):
+                candidate_rotvec = np.asarray(best["wrist_rotvec_local"], dtype=np.float64).copy()
+                candidate_rotvec[axis] += direction * rotation_steps[axis]
+                candidate = _evaluate_projected_candidate(
+                    runtime=runtime,
+                    config=config,
+                    object_pose_goal=object_pose_goal,
+                    source_wrist_pose_world=source_wrist_pose_world,
+                    source_semantic_sites_world=source_semantic_sites_world,
+                    source_contact_mask_12=source_contact_mask_12,
+                    wrist_translation_local=np.asarray(best["wrist_translation_local"], dtype=np.float64),
+                    wrist_rotvec_local=candidate_rotvec,
+                    hand_qpos=np.asarray(best["hand_qpos"], dtype=np.float64),
+                )
+                if _is_better_projected_candidate(candidate, best, required_contacts):
+                    best = candidate
+                    improved = True
+
+        for joint_idx in range(len(hand_steps)):
+            for direction in (-1.0, 1.0):
+                candidate_hand_qpos = np.asarray(best["hand_qpos"], dtype=np.float64).copy()
+                candidate_hand_qpos[joint_idx] += direction * hand_steps[joint_idx]
+                candidate = _evaluate_projected_candidate(
+                    runtime=runtime,
+                    config=config,
+                    object_pose_goal=object_pose_goal,
+                    source_wrist_pose_world=source_wrist_pose_world,
+                    source_semantic_sites_world=source_semantic_sites_world,
+                    source_contact_mask_12=source_contact_mask_12,
+                    wrist_translation_local=np.asarray(best["wrist_translation_local"], dtype=np.float64),
+                    wrist_rotvec_local=np.asarray(best["wrist_rotvec_local"], dtype=np.float64),
+                    hand_qpos=candidate_hand_qpos,
+                )
+                if _is_better_projected_candidate(candidate, best, required_contacts):
+                    best = candidate
+                    improved = True
+
+        if not improved:
+            break
+
+    return best
 
 
 def _project_feasible_target(
@@ -360,15 +568,26 @@ def _project_feasible_target(
 
     base_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
     contact_biased_hand = runtime.clamp_hand(base_hand_qpos + _finger_contact_bias_from_mask(source_contact_mask_12))
+    aggressive_contact_hand = runtime.clamp_hand(base_hand_qpos + 1.45 * _finger_contact_bias_from_mask(source_contact_mask_12))
+    required_contacts = _required_target_contact_count(source_contact_mask_12)
     seed_states = [
-        (np.array([0.0, 0.0, 0.0], dtype=np.float64), base_hand_qpos),
-        (np.array([0.0, 0.0, -0.006], dtype=np.float64), contact_biased_hand),
-        (np.array([0.0, 0.0, -0.003], dtype=np.float64), contact_biased_hand),
+        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.zeros(3, dtype=np.float64), base_hand_qpos),
+        (np.array([0.0, 0.0, -0.006], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
+        (np.array([0.0, 0.0, -0.003], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
+        (np.array([0.0, 0.0, 0.002], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
+        (np.array([0.0, 0.0, 0.001], dtype=np.float64), np.deg2rad(np.array([0.0, -4.0, 0.0], dtype=np.float64)), aggressive_contact_hand),
+        (np.array([0.0, 0.0, 0.001], dtype=np.float64), np.deg2rad(np.array([0.0, 4.0, 0.0], dtype=np.float64)), aggressive_contact_hand),
+        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([3.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
+        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([-3.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
     ]
 
     translation_step_schedule = [
         np.array([0.004, 0.004, 0.006], dtype=np.float64),
         np.array([0.0015, 0.0015, 0.0025], dtype=np.float64),
+    ]
+    rotation_step_schedule = [
+        np.deg2rad(np.array([4.0, 4.0, 6.0], dtype=np.float64)),
+        np.deg2rad(np.array([1.5, 1.5, 2.5], dtype=np.float64)),
     ]
     hand_step_schedule = [
         np.array([0.14, 0.10, 0.14, 0.14, 0.14, 0.14], dtype=np.float64),
@@ -377,7 +596,7 @@ def _project_feasible_target(
 
     global_best: dict[str, Any] | None = None
 
-    for seed_translation, seed_hand_qpos in seed_states:
+    for seed_translation, seed_rotvec, seed_hand_qpos in seed_states:
         best = _evaluate_projected_candidate(
             runtime=runtime,
             config=config,
@@ -386,57 +605,83 @@ def _project_feasible_target(
             source_semantic_sites_world=source_semantic_sites_world,
             source_contact_mask_12=source_contact_mask_12,
             wrist_translation_local=seed_translation,
+            wrist_rotvec_local=seed_rotvec,
             hand_qpos=seed_hand_qpos,
         )
 
-        for translation_steps, hand_steps in zip(translation_step_schedule, hand_step_schedule):
-            for _ in range(2):
-                improved = False
+        for translation_steps, rotation_steps, hand_steps in zip(
+            translation_step_schedule,
+            rotation_step_schedule,
+            hand_step_schedule,
+        ):
+            best = _coordinate_descent_projected_candidate(
+                runtime=runtime,
+                config=config,
+                object_pose_goal=object_pose_goal,
+                source_wrist_pose_world=source_wrist_pose_world,
+                source_semantic_sites_world=source_semantic_sites_world,
+                source_contact_mask_12=source_contact_mask_12,
+                best=best,
+                required_contacts=required_contacts,
+                translation_steps=translation_steps,
+                rotation_steps=rotation_steps,
+                hand_steps=hand_steps,
+                passes=3,
+            )
 
-                for axis in range(3):
-                    for direction in (-1.0, 1.0):
-                        candidate_translation = np.asarray(best["wrist_translation_local"], dtype=np.float64).copy()
-                        candidate_translation[axis] += direction * translation_steps[axis]
-                        candidate = _evaluate_projected_candidate(
-                            runtime=runtime,
-                            config=config,
-                            object_pose_goal=object_pose_goal,
-                            source_wrist_pose_world=source_wrist_pose_world,
-                            source_semantic_sites_world=source_semantic_sites_world,
-                            source_contact_mask_12=source_contact_mask_12,
-                            wrist_translation_local=candidate_translation,
-                            hand_qpos=np.asarray(best["hand_qpos"], dtype=np.float64),
-                        )
-                        if candidate["score"] < best["score"] - 1e-9:
-                            best = candidate
-                            improved = True
-
-                if not improved:
-                    break
-
-                for joint_idx in range(len(base_hand_qpos)):
-                    for direction in (-1.0, 1.0):
-                        candidate_hand_qpos = np.asarray(best["hand_qpos"], dtype=np.float64).copy()
-                        candidate_hand_qpos[joint_idx] += direction * hand_steps[joint_idx]
-                        candidate = _evaluate_projected_candidate(
-                            runtime=runtime,
-                            config=config,
-                            object_pose_goal=object_pose_goal,
-                            source_wrist_pose_world=source_wrist_pose_world,
-                            source_semantic_sites_world=source_semantic_sites_world,
-                            source_contact_mask_12=source_contact_mask_12,
-                            wrist_translation_local=np.asarray(best["wrist_translation_local"], dtype=np.float64),
-                            hand_qpos=candidate_hand_qpos,
-                        )
-                        if candidate["score"] < best["score"] - 1e-9:
-                            best = candidate
-                            improved = True
-
-        if global_best is None or best["score"] < global_best["score"]:
+        if _is_better_projected_candidate(best, global_best, required_contacts):
             global_best = best
 
     if global_best is None:
         raise RuntimeError("Failed to project a feasible pose-driven target.")
+
+    contact_recovery_bias = _finger_contact_bias_from_mask(source_contact_mask_12)
+    contact_recovery_seeds = [
+        (
+            np.asarray(global_best["wrist_translation_local"], dtype=np.float64),
+            np.asarray(global_best["wrist_rotvec_local"], dtype=np.float64),
+            np.asarray(global_best["hand_qpos"], dtype=np.float64),
+        ),
+        (
+            np.asarray(global_best["wrist_translation_local"], dtype=np.float64) + np.array([0.0, 0.0, 0.002], dtype=np.float64),
+            np.asarray(global_best["wrist_rotvec_local"], dtype=np.float64),
+            runtime.clamp_hand(np.asarray(global_best["hand_qpos"], dtype=np.float64) + 0.60 * contact_recovery_bias),
+        ),
+        (
+            np.asarray(global_best["wrist_translation_local"], dtype=np.float64) + np.array([0.0, 0.0, 0.004], dtype=np.float64),
+            np.asarray(global_best["wrist_rotvec_local"], dtype=np.float64),
+            runtime.clamp_hand(np.asarray(global_best["hand_qpos"], dtype=np.float64) + 1.00 * contact_recovery_bias),
+        ),
+    ]
+
+    for seed_translation, seed_rotvec, seed_hand_qpos in contact_recovery_seeds:
+        candidate = _evaluate_projected_candidate(
+            runtime=runtime,
+            config=config,
+            object_pose_goal=object_pose_goal,
+            source_wrist_pose_world=source_wrist_pose_world,
+            source_semantic_sites_world=source_semantic_sites_world,
+            source_contact_mask_12=source_contact_mask_12,
+            wrist_translation_local=seed_translation,
+            wrist_rotvec_local=seed_rotvec,
+            hand_qpos=seed_hand_qpos,
+        )
+        candidate = _coordinate_descent_projected_candidate(
+            runtime=runtime,
+            config=config,
+            object_pose_goal=object_pose_goal,
+            source_wrist_pose_world=source_wrist_pose_world,
+            source_semantic_sites_world=source_semantic_sites_world,
+            source_contact_mask_12=source_contact_mask_12,
+            best=candidate,
+            required_contacts=required_contacts,
+            translation_steps=np.array([0.0012, 0.0012, 0.0018], dtype=np.float64),
+            rotation_steps=np.deg2rad(np.array([1.2, 1.2, 1.8], dtype=np.float64)),
+            hand_steps=np.array([0.035, 0.025, 0.035, 0.035, 0.035, 0.035], dtype=np.float64),
+            passes=4,
+        )
+        if _is_better_projected_candidate(candidate, global_best, required_contacts):
+            global_best = candidate
 
     global_best["retreat_m"] = float(max(0.0, -float(np.asarray(global_best["wrist_translation_local"])[2])))
     global_best["hand_open_blend"] = float(
@@ -487,7 +732,7 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
 
         arm_qpos = solve_arm_wrist_palm_ik(
             runtime=runtime,
-            target_sites_world=wrist_pose_to_target_sites(source_wrist_pose_goal_world),
+            target_wrist_pose_world=source_wrist_pose_goal_world,
             initial_arm_qpos=previous_arm_qpos,
             hand_qpos=previous_hand_qpos,
             iterations=config.conversion.arm_ik_iterations,
@@ -532,6 +777,11 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "source_contact_hamming": float(projected["source_contact_hamming"]),
             "source_contact_misses": float(projected["source_contact_misses"]),
             "source_extra_contacts": float(projected["source_extra_contacts"]),
+            "projected_matched_target_contacts": float(projected["source_matched_target_contacts"]),
+            "projected_required_target_contacts": float(projected["required_target_contacts"]),
+            "projected_hard_contact_count": float(np.sum(np.asarray(projected["physical_contact_mask_12"], dtype=np.float64) > 0.5)),
+            "projected_hybrid_contact_count": float(np.sum(np.asarray(projected["contact_mask_12"], dtype=np.float64) > 0.5)),
+            "projected_min_contact_distance_m": float(np.min(np.asarray(projected["contact_distance_12_m"], dtype=np.float64))),
             "projected_total_penetration_m": float(projected["total_penetration_m"]),
             "projected_max_penetration_m": float(projected["max_penetration_m"]),
             "projected_object_translation_drift_m": float(projected["object_translation_drift_m"]),
@@ -542,10 +792,12 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "optimizer_cost": optimizer_cost,
         }
         valid_execution = bool(
-            fit_error["projected_max_penetration_m"] <= 0.0025
-            and fit_error["source_tip_rmse_m"] <= 0.08
-            and fit_error["projected_object_translation_drift_m"] <= 0.04
+            fit_error["projected_max_penetration_m"] <= PROJECTION_HARD_MAX_PENETRATION_M
+            and fit_error["source_tip_rmse_m"] <= 0.085
+            and fit_error["projected_object_translation_drift_m"] <= PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M
+            and fit_error["projected_object_rotation_drift_deg"] <= PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG
             and not bool(projected["table_contact"])
+            and fit_error["projected_matched_target_contacts"] >= fit_error["projected_required_target_contacts"]
         )
 
         samples.append(
@@ -561,6 +813,10 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
                 semantic_sites_goal_world_21=flatten_sites(projected_semantic_sites_world),
                 semantic_sites_goal_object_21=flatten_sites(projected_semantic_sites_object),
                 source_contact_mask_12=[float(v) for v in source_contact_mask],
+                physical_contact_mask_12=[float(v) for v in projected["physical_contact_mask_12"]],
+                proximity_contact_mask_12=[float(v) for v in projected["proximity_contact_mask_12"]],
+                contact_proximity_score_12=[float(v) for v in projected["contact_proximity_score_12"]],
+                contact_distance_12_m=[float(v) for v in projected["contact_distance_12_m"]],
                 contact_mask_12=[float(v) for v in projected["contact_mask_12"]],
                 valid_execution=valid_execution,
                 fit_error=fit_error,
@@ -571,7 +827,10 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
                 "label_idx": label_idx,
                 "valid_execution": valid_execution,
                 "source_contact_mask_12": [int(round(v)) for v in source_contact_mask],
+                "projected_physical_contact_mask_12": [int(round(v)) for v in projected["physical_contact_mask_12"]],
+                "projected_proximity_contact_mask_12": [int(round(v)) for v in projected["proximity_contact_mask_12"]],
                 "projected_contact_mask_12": [int(round(v)) for v in projected["contact_mask_12"]],
+                "projected_contact_distance_12_m": [float(v) for v in projected["contact_distance_12_m"]],
                 **fit_error,
             }
         )

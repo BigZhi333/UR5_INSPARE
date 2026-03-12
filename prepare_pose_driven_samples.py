@@ -38,6 +38,14 @@ def main() -> None:
         [sample.fit_error.get("source_contact_hamming", 0.0) for sample in samples],
         dtype=np.float64,
     )
+    matched_contacts = np.asarray(
+        [sample.fit_error.get("projected_matched_target_contacts", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
+    required_contacts = np.asarray(
+        [sample.fit_error.get("projected_required_target_contacts", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
     valid_count = int(sum(sample.valid_execution for sample in samples))
     best_index = int(np.argmin(source_tip_errors))
     print(f"Prepared {len(samples)} pose-driven samples: {pose_driven_samples_path(config)}")
@@ -56,6 +64,18 @@ def main() -> None:
         "Source contact hamming after projection: "
         f"mean={contact_hamming.mean():.2f}, std={contact_hamming.std():.2f}, "
         f"min={contact_hamming.min():.0f}, max={contact_hamming.max():.0f}"
+    )
+    print(
+        "Matched target contacts after projection: "
+        f"mean={matched_contacts.mean():.2f}, std={matched_contacts.std():.2f}, "
+        f"min={matched_contacts.min():.0f}, max={matched_contacts.max():.0f}"
+    )
+    print(
+        "Contact buckets: "
+        f"zero={(matched_contacts < 0.5).sum()}, "
+        f"one={((matched_contacts >= 0.5) & (matched_contacts < 1.5)).sum()}, "
+        f"ge2={(matched_contacts >= 1.5).sum()}, "
+        f"required_met={(matched_contacts + 1e-9 >= required_contacts).sum()}/{len(samples)}"
     )
     print(f"Best sample index: {best_index}, label_idx={samples[best_index].label_idx}")
     print(f"Report: {pose_driven_report_path(config)}")

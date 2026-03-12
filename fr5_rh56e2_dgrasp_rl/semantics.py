@@ -28,6 +28,20 @@ SEMANTIC_CONTACT_NAMES = (
     "little_proximal",
     "little_distal",
 )
+SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M = (
+    0.0055,  # palm
+    0.0050,  # thumb proximal
+    0.0045,  # thumb middle
+    0.0045,  # thumb distal
+    0.0050,  # index proximal
+    0.0045,  # index distal
+    0.0050,  # middle proximal
+    0.0045,  # middle distal
+    0.0050,  # ring proximal
+    0.0045,  # ring distal
+    0.0050,  # little proximal
+    0.0045,  # little distal
+)
 
 WRIST_INDEX = 0
 # D-Grasp stores the 21 joints in wrist, index, middle, ring, little, thumb order.

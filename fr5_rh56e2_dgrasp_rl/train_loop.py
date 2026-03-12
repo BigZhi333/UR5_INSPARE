@@ -21,17 +21,39 @@ from .task_config import TaskConfig
 def _info_array(infos: dict, key: str, num_envs: int) -> np.ndarray:
     if key in infos:
         return np.asarray(infos[key], dtype=np.float64).reshape(num_envs)
+    if "final_info" in infos and "_final_info" in infos:
+        mask = np.asarray(infos["_final_info"], dtype=bool).reshape(num_envs)
+        values = np.zeros(num_envs, dtype=np.float64)
+        final_info = infos["final_info"]
+        for idx in range(num_envs):
+            if not mask[idx]:
+                continue
+            payload = final_info[idx]
+            if payload is None or key not in payload:
+                continue
+            values[idx] = float(payload[key])
+        return values
     return np.zeros(num_envs, dtype=np.float64)
 
 
 def _maybe_info_array(infos: dict, key: str, num_envs: int) -> np.ndarray | None:
     if key not in infos:
+        if "final_info" in infos and "_final_info" in infos:
+            mask = np.asarray(infos["_final_info"], dtype=bool).reshape(num_envs)
+            final_info = infos["final_info"]
+            for idx in range(num_envs):
+                if mask[idx] and final_info[idx] is not None and key in final_info[idx]:
+                    return _info_array(infos, key, num_envs)
         return None
     return np.asarray(infos[key], dtype=np.float64).reshape(num_envs)
 
 
 def _format_metric(value: float, precision: int = 4) -> str:
     return f"{value:.{precision}f}"
+
+
+def _nonfinite_names(metric_groups: dict[str, float]) -> list[str]:
+    return [name for name, value in metric_groups.items() if not np.isfinite(value)]
 
 
 def _print_update_summary(
@@ -45,9 +67,19 @@ def _print_update_summary(
     episode_reward_mean: float,
     episode_reward_std: float,
     success: float,
+    goal_attained: float,
     displacement_mean: float,
     displacement_std: float,
     step_means: dict[str, float],
+    action_abs_mean: float,
+    wrist_pos_abs_mean: float,
+    wrist_rot_abs_mean: float,
+    hand_abs_mean: float,
+    action_sat_mean: float,
+    wrist_pos_sat_mean: float,
+    wrist_rot_sat_mean: float,
+    hand_sat_mean: float,
+    warnings: list[str],
     stats,
 ) -> None:
     print("=" * 110)
@@ -63,9 +95,20 @@ def _print_update_summary(
     print(
         "  task:   "
         f"success={_format_metric(success, 3)}  "
+        f"goal_attained={_format_metric(goal_attained, 3)}  "
         f"disp={_format_metric(displacement_mean, 6)} +/- {_format_metric(displacement_std, 6)}  "
+        f"obj_disp={_format_metric(step_means['object_displacement_m'], 4)}  "
+        f"table_clear={_format_metric(step_means['table_clearance_m'], 4)}  "
         f"slip={_format_metric(step_means['slipped'], 3)}  "
-        f"table_contact={_format_metric(step_means['table_contact'], 3)}"
+        f"table_contact={_format_metric(step_means['table_contact'], 3)}  "
+        f"reg_scale={_format_metric(step_means['motion_regularization_scale'], 2)}"
+    )
+    print(
+        "  sample: "
+        f"valid_goal={_format_metric(step_means['goal_valid_execution'], 3)}  "
+        f"hand_clip={_format_metric(step_means['hand_target_clip_fraction'], 3)}  "
+        f"arm_lim={_format_metric(step_means['arm_joint_limit_fraction'], 3)}  "
+        f"hand_lim={_format_metric(step_means['hand_joint_limit_fraction'], 3)}"
     )
     print(
         "  error:  "
@@ -75,18 +118,37 @@ def _print_update_summary(
         f"hand={_format_metric(step_means['hand_pose_error'])}"
     )
     print(
+        "  exec:   "
+        f"wrist_cmd_t={_format_metric(step_means['wrist_command_translation_error_m'])}  "
+        f"wrist_cmd_r={_format_metric(step_means['wrist_command_rotation_error_deg'], 2)}  "
+        f"hand_cmd={_format_metric(step_means['hand_command_error'])}"
+    )
+    print(
         "  contact:"
-        f" match={_format_metric(step_means['contact_bit_match'], 3)}  "
-        f"target_hit={_format_metric(step_means['matched_positive_contacts'], 3)}  "
-        f"false_pos={_format_metric(step_means['false_positive_contacts'], 3)}  "
+        f" tgt={_format_metric(step_means['target_contact_count'], 2)}  "
+        f"hyb={_format_metric(step_means['hybrid_contact_count'], 2)}  "
+        f"hard={_format_metric(step_means['hard_contact_count'], 2)}  "
+        f"prox={_format_metric(step_means['proximity_contact_count'], 2)}  "
+        f"hit={_format_metric(step_means['matched_positive_contacts'], 3)}  "
+        f"hard_hit={_format_metric(step_means['hard_matched_positive_contacts'], 3)}  "
         f"impulse={_format_metric(step_means['impulse_term'], 3)}"
     )
     print(
-        "  reward terms(raw): "
+        "  contact:"
+        f" match={_format_metric(step_means['contact_bit_match'], 3)}  "
+        f"hard_match={_format_metric(step_means['hard_contact_bit_match'], 3)}  "
+        f"prox_match={_format_metric(step_means['proximity_contact_bit_match'], 3)}  "
+        f"dist={_format_metric(step_means['target_contact_distance_mean_m'], 4)}m  "
+        f"dist_min={_format_metric(step_means['target_contact_distance_min_m'], 4)}m  "
+        f"force={_format_metric(step_means['target_contact_force_mean_n'], 3)}N"
+    )
+    print(
+        "  reward raw:       "
         f"site={_format_metric(step_means['term_site'])}  "
         f"pose={_format_metric(step_means['term_pose'])}  "
         f"w_pose={_format_metric(step_means['term_wrist_pose'])}  "
         f"w_align={_format_metric(step_means['term_wrist_align'])}  "
+        f"obj={_format_metric(step_means['term_obj'])}  "
         f"contact={_format_metric(step_means['contact_term'])}  "
         f"penetration={_format_metric(step_means['term_penetration'])}"
     )
@@ -96,6 +158,7 @@ def _print_update_summary(
         f"pose={_format_metric(step_means['reward_pose'])}  "
         f"w_pose={_format_metric(step_means['reward_wrist_pose'])}  "
         f"w_align={_format_metric(step_means['reward_wrist_align'])}  "
+        f"obj={_format_metric(step_means['reward_obj'])}  "
         f"contact={_format_metric(step_means['reward_contact'])}  "
         f"impulse={_format_metric(step_means['reward_impulse'])}"
     )
@@ -115,12 +178,25 @@ def _print_update_summary(
         f"clip_delta={_format_metric(step_means['reward_clip_delta'])}"
     )
     print(
+        "  policy: "
+        f"|a|={_format_metric(action_abs_mean, 3)}  "
+        f"|wp|={_format_metric(wrist_pos_abs_mean, 3)}  "
+        f"|wr|={_format_metric(wrist_rot_abs_mean, 3)}  "
+        f"|hand|={_format_metric(hand_abs_mean, 3)}  "
+        f"sat={_format_metric(action_sat_mean, 3)}  "
+        f"wp_sat={_format_metric(wrist_pos_sat_mean, 3)}  "
+        f"wr_sat={_format_metric(wrist_rot_sat_mean, 3)}  "
+        f"hand_sat={_format_metric(hand_sat_mean, 3)}"
+    )
+    print(
         "  ppo:    "
         f"policy_loss={_format_metric(stats.policy_loss)}  "
         f"value_loss={_format_metric(stats.value_loss)}  "
         f"entropy={_format_metric(stats.entropy)}  "
         f"approx_kl={_format_metric(stats.approx_kl)}"
     )
+    if warnings:
+        print("  warning: " + ", ".join(warnings))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -184,21 +260,42 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         "wrist_rotation_error_deg",
         "site_rmse_m",
         "hand_pose_error",
+        "wrist_command_translation_error_m",
+        "wrist_command_rotation_error_deg",
+        "hand_command_error",
         "term_site",
         "term_pose",
         "term_wrist_pose",
         "term_wrist_align",
+        "term_obj",
         "contact_term",
         "contact_bit_match",
         "matched_positive_contacts",
         "false_positive_contacts",
+        "hard_contact_bit_match",
+        "hard_matched_positive_contacts",
+        "hard_false_positive_contacts",
+        "proximity_contact_bit_match",
+        "proximity_matched_positive_contacts",
+        "proximity_false_positive_contacts",
+        "target_contact_count",
+        "hybrid_contact_count",
+        "hard_contact_count",
+        "proximity_contact_count",
+        "target_contact_distance_mean_m",
+        "target_contact_distance_min_m",
+        "all_contact_distance_mean_m",
+        "target_contact_proximity_score_mean",
         "impulse_term",
+        "target_contact_force_mean_n",
+        "target_contact_force_max_n",
         "term_falling",
         "term_rel_obj",
         "term_body_vel",
         "term_body_qvel",
         "term_penetration",
         "term_action_rate",
+        "motion_regularization_scale",
         "reward_site",
         "reward_pose",
         "reward_wrist_pose",
@@ -206,6 +303,7 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         "reward_contact",
         "reward_impulse",
         "reward_falling",
+        "reward_obj",
         "reward_rel_obj",
         "reward_body_vel",
         "reward_body_qvel",
@@ -218,10 +316,16 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         "max_penetration_m",
         "falling_term",
         "object_height_m",
+        "object_displacement_m",
+        "table_clearance_m",
         "table_contact",
         "slipped",
         "table_dropped",
         "step_displacement",
+        "goal_valid_execution",
+        "hand_target_clip_fraction",
+        "arm_joint_limit_fraction",
+        "hand_joint_limit_fraction",
     ]
     total_env_steps = 0
 
@@ -248,6 +352,10 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         wrist_pos_abs_sum = 0.0
         wrist_rot_abs_sum = 0.0
         hand_abs_sum = 0.0
+        action_sat_sum = 0.0
+        wrist_pos_sat_sum = 0.0
+        wrist_rot_sat_sum = 0.0
+        hand_sat_sum = 0.0
         action_samples = 0
         final_infos: dict = {}
 
@@ -260,6 +368,10 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
             wrist_pos_abs_sum += float(np.abs(actions[:, :3]).mean())
             wrist_rot_abs_sum += float(np.abs(actions[:, 3:6]).mean())
             hand_abs_sum += float(np.abs(actions[:, 6:]).mean())
+            action_sat_sum += float((np.abs(actions) >= 0.95).mean())
+            wrist_pos_sat_sum += float((np.abs(actions[:, :3]) >= 0.95).mean())
+            wrist_rot_sat_sum += float((np.abs(actions[:, 3:6]) >= 0.95).mean())
+            hand_sat_sum += float((np.abs(actions[:, 6:]) >= 0.95).mean())
             action_samples += 1
             next_obs, rewards, terminated, truncated, infos = vector_env.step(actions)
             dones = np.logical_or(terminated, truncated).astype(np.float32)
@@ -290,6 +402,7 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         update_seconds = time.perf_counter() - update_start_time
         fps = float(config.total_episode_steps * num_envs / max(update_seconds, 1e-8))
         success = float(_info_array(final_infos, "episode_success", num_envs).mean())
+        goal_attained = float(_info_array(final_infos, "episode_goal_attained", num_envs).mean())
         displacement_mean = float(_info_array(final_infos, "displacement_mean", num_envs).mean())
         displacement_std = float(_info_array(final_infos, "displacement_std", num_envs).mean())
         episode_reward_mean = float(_info_array(final_infos, "episode_reward", num_envs).mean())
@@ -304,6 +417,25 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         wrist_pos_abs_mean = wrist_pos_abs_sum / max(action_samples, 1)
         wrist_rot_abs_mean = wrist_rot_abs_sum / max(action_samples, 1)
         hand_abs_mean = hand_abs_sum / max(action_samples, 1)
+        action_sat_mean = action_sat_sum / max(action_samples, 1)
+        wrist_pos_sat_mean = wrist_pos_sat_sum / max(action_samples, 1)
+        wrist_rot_sat_mean = wrist_rot_sat_sum / max(action_samples, 1)
+        hand_sat_mean = hand_sat_sum / max(action_samples, 1)
+        warnings = _nonfinite_names(
+            {
+                "rollout_reward_mean": rollout_reward_mean,
+                "episode_reward_mean": episode_reward_mean,
+                "success": success,
+                "goal_attained": goal_attained,
+                "displacement_mean": displacement_mean,
+                "fps": fps,
+                "policy_loss": float(stats.policy_loss),
+                "value_loss": float(stats.value_loss),
+                "entropy": float(stats.entropy),
+                "approx_kl": float(stats.approx_kl),
+                **{f"rollout/{key}": float(value) for key, value in step_means.items()},
+            }
+        )
 
         writer.add_scalar("train/rollout_reward", rollout_reward_mean, update)
         writer.add_scalar("train/rollout_reward_mean", rollout_reward_mean, update)
@@ -311,6 +443,7 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         writer.add_scalar("train/episode_reward_mean", episode_reward_mean, update)
         writer.add_scalar("train/episode_reward_std", episode_reward_std, update)
         writer.add_scalar("train/success_rate", success, update)
+        writer.add_scalar("train/goal_attained_rate", goal_attained, update)
         writer.add_scalar("train/displacement_mean", displacement_mean, update)
         writer.add_scalar("train/displacement_std", displacement_std, update)
         writer.add_scalar("train/total_env_steps", float(total_env_steps), update)
@@ -324,6 +457,11 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
         writer.add_scalar("policy/wrist_pos_action_abs_mean", wrist_pos_abs_mean, update)
         writer.add_scalar("policy/wrist_rot_action_abs_mean", wrist_rot_abs_mean, update)
         writer.add_scalar("policy/hand_action_abs_mean", hand_abs_mean, update)
+        writer.add_scalar("policy/action_saturation_frac", action_sat_mean, update)
+        writer.add_scalar("policy/wrist_pos_action_saturation_frac", wrist_pos_sat_mean, update)
+        writer.add_scalar("policy/wrist_rot_action_saturation_frac", wrist_rot_sat_mean, update)
+        writer.add_scalar("policy/hand_action_saturation_frac", hand_sat_mean, update)
+        writer.add_scalar("warnings/non_finite_metric_count", float(len(warnings)), update)
 
         for key, value in step_means.items():
             writer.add_scalar(f"rollout/{key}", value, update)
@@ -341,6 +479,7 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
             "episode_reward_mean": episode_reward_mean,
             "episode_reward_std": episode_reward_std,
             "success_rate": success,
+            "goal_attained_rate": goal_attained,
             "displacement_mean": displacement_mean,
             "displacement_std": displacement_std,
             "fps_env_steps": fps,
@@ -353,6 +492,11 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
             "wrist_pos_action_abs_mean": wrist_pos_abs_mean,
             "wrist_rot_action_abs_mean": wrist_rot_abs_mean,
             "hand_action_abs_mean": hand_abs_mean,
+            "action_saturation_frac": action_sat_mean,
+            "wrist_pos_action_saturation_frac": wrist_pos_sat_mean,
+            "wrist_rot_action_saturation_frac": wrist_rot_sat_mean,
+            "hand_action_saturation_frac": hand_sat_mean,
+            "warnings": warnings,
             "rollout_metrics": step_means,
         }
         (log_dir / "latest_progress.json").write_text(
@@ -373,9 +517,19 @@ def train_main(args: argparse.Namespace | None = None) -> Path:
                 episode_reward_mean=episode_reward_mean,
                 episode_reward_std=episode_reward_std,
                 success=success,
+                goal_attained=goal_attained,
                 displacement_mean=displacement_mean,
                 displacement_std=displacement_std,
                 step_means=step_means,
+                action_abs_mean=action_abs_mean,
+                wrist_pos_abs_mean=wrist_pos_abs_mean,
+                wrist_rot_abs_mean=wrist_rot_abs_mean,
+                hand_abs_mean=hand_abs_mean,
+                action_sat_mean=action_sat_mean,
+                wrist_pos_sat_mean=wrist_pos_sat_mean,
+                wrist_rot_sat_mean=wrist_rot_sat_mean,
+                hand_sat_mean=hand_sat_mean,
+                warnings=warnings,
                 stats=stats,
             )
 

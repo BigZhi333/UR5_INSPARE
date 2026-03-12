@@ -4,7 +4,6 @@ import argparse
 import json
 from pathlib import Path
 
-import mujoco
 import numpy as np
 
 from fr5_rh56e2_dgrasp_rl.kinematics import solve_arm_wrist_palm_ik
@@ -15,28 +14,11 @@ from fr5_rh56e2_dgrasp_rl.pose_driven_data import (
     load_pose_driven_samples,
     pose_driven_samples_path,
     prepare_pose_driven_samples,
-    wrist_pose_to_target_sites,
 )
 from fr5_rh56e2_dgrasp_rl.robot_model import RobotSceneModel
 from fr5_rh56e2_dgrasp_rl.scene_builder import build_training_scene
 from fr5_rh56e2_dgrasp_rl.semantics import SEMANTIC_CONTACT_NAMES
 from fr5_rh56e2_dgrasp_rl.task_config import TaskConfig
-
-
-CONTACT_GROUP_BODIES_12 = {
-    "palm": ["j6_Link"],
-    "thumb_proximal": ["rh56e2_right_thumb_2"],
-    "thumb_middle": ["rh56e2_right_thumb_3"],
-    "thumb_distal": ["rh56e2_right_thumb_4"],
-    "index_proximal": ["rh56e2_right_index_1"],
-    "index_distal": ["rh56e2_right_index_2"],
-    "middle_proximal": ["rh56e2_right_middle_1"],
-    "middle_distal": ["rh56e2_right_middle_2"],
-    "ring_proximal": ["rh56e2_right_ring_1"],
-    "ring_distal": ["rh56e2_right_ring_2"],
-    "little_proximal": ["rh56e2_right_little_1"],
-    "little_distal": ["rh56e2_right_little_2"],
-}
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -54,50 +36,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_contact_body_ids(runtime: RobotSceneModel) -> dict[str, set[int]]:
-    return {
-        group_name: {
-            mujoco.mj_name2id(runtime.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            for body_name in body_names
-        }
-        for group_name, body_names in CONTACT_GROUP_BODIES_12.items()
-    }
-
-
-def _get_contact_mask_12(runtime: RobotSceneModel, group_body_ids: dict[str, set[int]]) -> tuple[np.ndarray, np.ndarray]:
-    mask = np.zeros(len(SEMANTIC_CONTACT_NAMES), dtype=np.float64)
-    forces = np.zeros(len(SEMANTIC_CONTACT_NAMES), dtype=np.float64)
-    group_names = list(SEMANTIC_CONTACT_NAMES)
-
-    for contact_index in range(runtime.data.ncon):
-        contact = runtime.data.contact[contact_index]
-        geom1 = int(contact.geom1)
-        geom2 = int(contact.geom2)
-        body1 = int(runtime.model.geom_bodyid[geom1])
-        body2 = int(runtime.model.geom_bodyid[geom2])
-        if body1 != runtime.object_body_id and body2 != runtime.object_body_id:
-            continue
-
-        other_body = body2 if body1 == runtime.object_body_id else body1
-        wrench = np.zeros(6, dtype=np.float64)
-        mujoco.mj_contactForce(runtime.model, runtime.data, contact_index, wrench)
-        force = float(np.linalg.norm(wrench[:3]))
-
-        for group_index, group_name in enumerate(group_names):
-            if other_body in group_body_ids[group_name]:
-                mask[group_index] = 1.0
-                forces[group_index] += force
-                break
-
-    return mask, forces
-
-
 def _solve_final_actuated_qpos(runtime: RobotSceneModel, config: TaskConfig, sample: PoseDrivenSample) -> np.ndarray:
     runtime.reset()
     runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
     arm_qpos = solve_arm_wrist_palm_ik(
         runtime=runtime,
-        target_sites_world=wrist_pose_to_target_sites(np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)),
+        target_wrist_pose_world=np.asarray(sample.wrist_pose_goal_world, dtype=np.float64),
         initial_arm_qpos=runtime.get_actuated_qpos()[:6],
         hand_qpos=np.asarray(sample.hand_qpos_6, dtype=np.float64),
         iterations=config.conversion.arm_ik_iterations,
@@ -124,8 +68,6 @@ def analyze_pose_driven_consistency(
 
     scene_xml, metadata_path = build_training_scene(config)
     runtime = RobotSceneModel(config, scene_xml=scene_xml, metadata_path=metadata_path)
-    group_body_ids = _build_contact_body_ids(runtime)
-
     site_rmse_values: list[float] = []
     site_max_values: list[float] = []
     wrist_fit_diff: list[float] = []
@@ -159,7 +101,9 @@ def analyze_pose_driven_consistency(
         runtime.reset()
         runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
         runtime.settle_actuated_pose(final_actuated_qpos, PROJECTION_SETTLE_STEPS)
-        actual_contact_mask, actual_contact_forces = _get_contact_mask_12(runtime, group_body_ids)
+        contact_diag = runtime.get_contact_diagnostics_12()
+        actual_contact_mask = np.asarray(contact_diag["hybrid_mask"], dtype=np.float64)
+        actual_contact_forces = np.asarray(contact_diag["forces"], dtype=np.float64)
         target_contact_mask = np.asarray(sample.contact_mask_12, dtype=np.float64)
         contact_hamming = int(np.abs(actual_contact_mask - target_contact_mask).sum())
 

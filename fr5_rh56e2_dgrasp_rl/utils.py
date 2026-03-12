@@ -65,6 +65,25 @@ def matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
     return normalize(quat)
 
 
+def quat_slerp_wxyz(start: Iterable[float], end: Iterable[float], alpha: float) -> np.ndarray:
+    q0 = normalize(np.asarray(list(start), dtype=np.float64))
+    q1 = normalize(np.asarray(list(end), dtype=np.float64))
+    t = float(np.clip(alpha, 0.0, 1.0))
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        return normalize((1.0 - t) * q0 + t * q1)
+    theta_0 = math.acos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = math.sin(theta_0)
+    theta = theta_0 * t
+    sin_theta = math.sin(theta)
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return normalize(s0 * q0 + s1 * q1)
+
+
 def pose7_to_matrix(pose: Iterable[float]) -> np.ndarray:
     pose_arr = np.asarray(list(pose), dtype=np.float64)
     matrix = np.eye(4, dtype=np.float64)
@@ -133,6 +152,16 @@ def compose_pose7(first: Iterable[float], second: Iterable[float]) -> np.ndarray
     return matrix_to_pose7(pose7_to_matrix(first) @ pose7_to_matrix(second))
 
 
+def interpolate_pose7(start_pose: Iterable[float], end_pose: Iterable[float], alpha: float) -> np.ndarray:
+    start = np.asarray(list(start_pose), dtype=np.float64)
+    end = np.asarray(list(end_pose), dtype=np.float64)
+    t = float(np.clip(alpha, 0.0, 1.0))
+    pose = np.zeros(7, dtype=np.float64)
+    pose[:3] = (1.0 - t) * start[:3] + t * end[:3]
+    pose[3:] = quat_slerp_wxyz(start[3:], end[3:], t)
+    return pose
+
+
 def rotation_6d_from_matrix(matrix: np.ndarray) -> np.ndarray:
     return matrix[:, :2].reshape(-1)
 
@@ -145,6 +174,25 @@ def rotation_angle_deg(current: np.ndarray, target: np.ndarray) -> float:
     delta = current.T @ target
     trace = np.clip((np.trace(delta) - 1.0) * 0.5, -1.0, 1.0)
     return math.degrees(math.acos(float(trace)))
+
+
+def rotation_error_world(current: np.ndarray, target: np.ndarray) -> np.ndarray:
+    delta_local = current.T @ target
+    cos_theta = np.clip((np.trace(delta_local) - 1.0) * 0.5, -1.0, 1.0)
+    theta = math.acos(float(cos_theta))
+    skew_part = np.array(
+        [
+            delta_local[2, 1] - delta_local[1, 2],
+            delta_local[0, 2] - delta_local[2, 0],
+            delta_local[1, 0] - delta_local[0, 1],
+        ],
+        dtype=np.float64,
+    )
+    if theta < 1e-9:
+        rotvec_local = 0.5 * skew_part
+    else:
+        rotvec_local = (theta / (2.0 * math.sin(theta))) * skew_part
+    return current @ rotvec_local
 
 
 def damped_least_squares(jacobian: np.ndarray, error: np.ndarray, damping: float) -> np.ndarray:

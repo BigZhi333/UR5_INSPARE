@@ -17,7 +17,6 @@ from fr5_rh56e2_dgrasp_rl.pose_driven_data import (
     pose_driven_samples_path,
     prepare_pose_driven_samples,
     wrist_pose_from_semantic_sites,
-    wrist_pose_to_target_sites,
 )
 from fr5_rh56e2_dgrasp_rl.robot_model import RobotSceneModel
 from fr5_rh56e2_dgrasp_rl.scene_builder import build_training_scene
@@ -169,6 +168,22 @@ def print_sample_summary(sample_index: int, sample: PoseDrivenSample, samples_pa
             f"{name}={int(round(value))}" for name, value in zip(SEMANTIC_CONTACT_NAMES, sample.contact_mask_12)
         )
     )
+    if hasattr(sample, "physical_contact_mask_12"):
+        print(
+            "Projected hard contact mask 12: "
+            + ", ".join(
+                f"{name}={int(round(value))}"
+                for name, value in zip(SEMANTIC_CONTACT_NAMES, sample.physical_contact_mask_12)
+            )
+        )
+    if hasattr(sample, "proximity_contact_mask_12"):
+        print(
+            "Projected proximity mask 12: "
+            + ", ".join(
+                f"{name}={int(round(value))}"
+                for name, value in zip(SEMANTIC_CONTACT_NAMES, sample.proximity_contact_mask_12)
+            )
+        )
     print(
         "Source contact mask 12: "
         + ", ".join(
@@ -180,7 +195,7 @@ def print_sample_summary(sample_index: int, sample: PoseDrivenSample, samples_pa
 def solve_final_arm_qpos(runtime: RobotSceneModel, config: TaskConfig, sample: PoseDrivenSample) -> np.ndarray:
     return solve_arm_wrist_palm_ik(
         runtime=runtime,
-        target_sites_world=wrist_pose_to_target_sites(np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)),
+        target_wrist_pose_world=np.asarray(sample.wrist_pose_goal_world, dtype=np.float64),
         initial_arm_qpos=runtime.get_actuated_qpos()[:6],
         hand_qpos=np.asarray(sample.hand_qpos_6, dtype=np.float64),
         iterations=config.conversion.arm_ik_iterations,
@@ -222,7 +237,7 @@ def play_sample_kinematic(
             hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
             arm_qpos = solve_arm_wrist_palm_ik(
                 runtime=runtime,
-                target_sites_world=wrist_pose_to_target_sites(wrist_pose),
+                target_wrist_pose_world=wrist_pose,
                 initial_arm_qpos=arm_qpos,
                 hand_qpos=hand_qpos,
                 iterations=config.conversion.arm_ik_iterations,
@@ -265,7 +280,7 @@ def play_sample_dynamic(
             hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
             arm_qpos = solve_arm_wrist_palm_ik(
                 runtime=runtime,
-                target_sites_world=wrist_pose_to_target_sites(wrist_pose),
+                target_wrist_pose_world=wrist_pose,
                 initial_arm_qpos=arm_qpos,
                 hand_qpos=hand_qpos,
                 iterations=config.conversion.arm_ik_iterations,

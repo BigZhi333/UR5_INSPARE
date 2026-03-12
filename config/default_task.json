@@ -56,6 +56,7 @@
     "contact_reward": 1.0,
     "impulse_reward": 2.0,
     "falling_reward": 1.0,
+    "obj_reward": 0.0,
     "rel_obj_reward": -1.0,
     "body_vel_reward": -0.5,
     "body_qvel_reward": -0.5,

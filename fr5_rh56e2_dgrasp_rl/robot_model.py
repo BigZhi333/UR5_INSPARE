@@ -8,7 +8,7 @@ import mujoco
 import numpy as np
 
 from .scene_builder import build_training_scene
-from .semantics import SEMANTIC_CONTACT_NAMES
+from .semantics import SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M, SEMANTIC_CONTACT_NAMES
 from .task_config import TaskConfig
 
 
@@ -103,12 +103,30 @@ class RobotSceneModel:
             group: {self.body_id_by_name[name] for name in body_names}
             for group, body_names in self.contact_group_bodies_12.items()
         }
+        self.body_geom_ids: dict[int, list[int]] = {}
+        for geom_id in range(self.model.ngeom):
+            body_id = int(self.model.geom_bodyid[geom_id])
+            self.body_geom_ids.setdefault(body_id, []).append(geom_id)
         self.object_body_id = self.body_id_by_name[self.object_body_name]
         self.table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, self.table_geom_name)
         self.object_joint_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, self.object_joint_name)
         self.object_qpos_adr = int(self.model.jnt_qposadr[self.object_joint_id])
         self.object_qvel_adr = int(self.model.jnt_dofadr[self.object_joint_id])
         self.original_table_center_z = float(self.model.geom_pos[self.table_geom_id, 2])
+        self.object_contact_geom_ids = [
+            geom_id
+            for geom_id in self.body_geom_ids.get(self.object_body_id, [])
+            if int(self.model.geom_contype[geom_id]) != 0 or int(self.model.geom_conaffinity[geom_id]) != 0
+        ]
+        self.contact_group_geom_ids_12 = {
+            group: [
+                geom_id
+                for body_id in body_ids
+                for geom_id in self.body_geom_ids.get(body_id, [])
+                if int(self.model.geom_contype[geom_id]) != 0 or int(self.model.geom_conaffinity[geom_id]) != 0
+            ]
+            for group, body_ids in self.contact_group_body_ids_12.items()
+        }
 
         self.actuated_lower = np.array([self.joint_limits[name][0] for name in self.actuated_joints], dtype=np.float64)
         self.actuated_upper = np.array([self.joint_limits[name][1] for name in self.actuated_joints], dtype=np.float64)
@@ -292,6 +310,42 @@ class RobotSceneModel:
 
         return mask, forces, table_contact, total_penetration, max_penetration
 
+    def _collect_object_proximity(
+        self,
+        group_geom_ids: dict[str, list[int]],
+        group_names: list[str],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        thresholds = np.asarray(SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M, dtype=np.float64)
+        distmax = float(np.max(thresholds) + 0.02)
+        distances = np.full(len(group_names), distmax, dtype=np.float64)
+        proximity_scores = np.zeros(len(group_names), dtype=np.float64)
+        proximity_mask = np.zeros(len(group_names), dtype=np.float64)
+
+        if not self.object_contact_geom_ids:
+            return distances, proximity_scores, proximity_mask
+
+        for group_index, group_name in enumerate(group_names):
+            min_distance = distmax
+            for object_geom_id in self.object_contact_geom_ids:
+                for group_geom_id in group_geom_ids.get(group_name, []):
+                    distance = float(
+                        mujoco.mj_geomDistance(
+                            self.model,
+                            self.data,
+                            object_geom_id,
+                            group_geom_id,
+                            distmax,
+                            None,
+                        )
+                    )
+                    min_distance = min(min_distance, distance)
+            threshold = float(thresholds[group_index])
+            distances[group_index] = min_distance
+            proximity_scores[group_index] = float(np.clip((threshold - min_distance) / max(threshold, 1e-8), 0.0, 1.0))
+            proximity_mask[group_index] = float(min_distance <= threshold)
+
+        return distances, proximity_scores, proximity_mask
+
     def get_contact_state(self) -> tuple[np.ndarray, np.ndarray, bool]:
         group_names = list(self.contact_group_body_ids.keys())
         mask, forces, table_contact, _, _ = self._collect_object_contacts(
@@ -312,9 +366,19 @@ class RobotSceneModel:
             self.contact_group_body_ids_12,
             list(SEMANTIC_CONTACT_NAMES),
         )
+        distances, proximity_scores, proximity_mask = self._collect_object_proximity(
+            self.contact_group_geom_ids_12,
+            list(SEMANTIC_CONTACT_NAMES),
+        )
+        hybrid_mask = np.maximum(mask, proximity_mask)
         return {
             "mask": mask,
+            "hard_mask": mask,
             "forces": forces,
+            "distances_m": distances,
+            "proximity_scores": proximity_scores,
+            "proximity_mask": proximity_mask,
+            "hybrid_mask": hybrid_mask,
             "table_contact": table_contact,
             "total_penetration_m": total_penetration,
             "max_penetration_m": max_penetration,
