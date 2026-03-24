@@ -30,6 +30,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parent / "config" / "default_task.json")
     parser.add_argument("--sample-index", type=int, default=None)
     parser.add_argument("--label-idx", type=int, default=None)
+    parser.add_argument("--all", action="store_true")
     parser.add_argument("--best-fit", action="store_true")
     parser.add_argument("--best-grasp", action="store_true")
     parser.add_argument("--force-prepare", action="store_true")
@@ -43,6 +44,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--animate-steps", type=int, default=180)
     parser.add_argument("--hold-steps", type=int, default=120)
+    parser.add_argument("--pause-steps", type=int, default=30)
     parser.add_argument("--sim-substeps", type=int, default=4)
     parser.add_argument("--kinematic", action="store_true")
     return parser
@@ -118,6 +120,13 @@ def select_sample(samples: list[PoseDrivenSample], args: argparse.Namespace) -> 
             num_contacts = float(sum(value > 0.5 for value in sample.contact_mask_12))
             return (
                 float(not sample.valid_execution),
+                -float(fit.get("projected_hold_hybrid_contact_group_count", 0.0)),
+                -float(fit.get("projected_hold_hard_contact_group_count", 0.0)),
+                -float(fit.get("projected_hold_has_thumb_opposition", 0.0)),
+                float(fit.get("projected_hold_object_drop_m", 999.0)),
+                float(fit.get("projected_anchor_rmse_m", 999.0)),
+                float(fit.get("projected_hold_object_translation_m", 999.0)),
+                float(fit.get("projected_hold_object_rotation_deg", 999.0)),
                 float(-(num_contacts > 0.0)),
                 -num_contacts,
                 float(fit.get("projected_max_penetration_m", 0.0)),
@@ -141,19 +150,45 @@ def select_sample(samples: list[PoseDrivenSample], args: argparse.Namespace) -> 
     return sample_index, samples[sample_index]
 
 
+def select_samples(samples: list[PoseDrivenSample], args: argparse.Namespace) -> list[tuple[int, PoseDrivenSample]]:
+    if args.all:
+        return list(enumerate(samples))
+    sample_index, sample = select_sample(samples, args)
+    return [(sample_index, sample)]
+
+
 def print_sample_summary(sample_index: int, sample: PoseDrivenSample, samples_path: Path) -> None:
     fit = sample.fit_error
     print(f"Samples file: {samples_path}")
     print(f"Sample index: {sample_index}")
     print(f"Label idx: {sample.label_idx}")
     print(f"Execution valid: {sample.valid_execution}")
+    method_flag = fit.get("retarget_method", 0.0)
+    method_name = "genhand_direct" if float(method_flag) >= 0.5 else "legacy_projection"
+    print(f"Retarget method: {method_name}")
     print(
         "Projection stats: "
         f"source_tip_rmse={fit.get('source_tip_rmse_m', fit.get('tip_rmse_m', 0.0)):.4f} m, "
+        f"anchor_rmse={fit.get('projected_anchor_rmse_m', 0.0):.4f} m, "
         f"max_penetration={fit.get('projected_max_penetration_m', 0.0):.4f} m, "
         f"contact_hamming={fit.get('source_contact_hamming', 0.0):.0f}, "
         f"retreat={fit.get('projected_retreat_m', 0.0):.4f} m"
     )
+    print(
+        "Hold stats: "
+        f"drop={fit.get('projected_hold_object_drop_m', 0.0):.4f} m, "
+        f"groups(hybrid/hard)={fit.get('projected_hold_hybrid_contact_group_count', 0.0):.1f}/"
+        f"{fit.get('projected_hold_hard_contact_group_count', 0.0):.1f}, "
+        f"thumb_opposition={int(round(fit.get('projected_hold_has_thumb_opposition', 0.0)))}"
+    )
+    if "projected_cylinder_palm_clearance_error_m" in fit:
+        print(
+            "Cylinder metrics: "
+            f"settled_clear={fit.get('projected_cylinder_palm_clearance_error_m', 0.0):.4f} m, "
+            f"settled_opp={fit.get('projected_cylinder_opposition_cos', 0.0):.3f}, "
+            f"hold_clear={fit.get('projected_hold_cylinder_palm_clearance_error_m', 0.0):.4f} m, "
+            f"hold_opp={fit.get('projected_hold_cylinder_opposition_cos', 0.0):.3f}"
+        )
     print(
         "Object goal pose: "
         + ", ".join(f"{value:.4f}" for value in sample.object_pose_goal[:3])
@@ -298,6 +333,106 @@ def play_sample_dynamic(
             time.sleep(1.0 / 60.0)
 
 
+def play_samples_kinematic(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    selected_samples: list[tuple[int, PoseDrivenSample]],
+    samples_path: Path,
+    animate_steps: int,
+    hold_steps: int,
+    pause_steps: int,
+) -> None:
+    with mujoco_viewer.launch_passive(runtime.model, runtime.data) as viewer:
+        configure_camera(viewer.cam)
+        for sample_index, sample in selected_samples:
+            print_sample_summary(sample_index, sample, samples_path)
+            runtime.reset()
+            runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
+
+            start_actuated = runtime.get_actuated_qpos()
+            start_wrist_pose = wrist_pose_from_semantic_sites(runtime.get_semantic_sites_world())
+            target_wrist_pose = np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)
+            target_hand_qpos = np.asarray(sample.hand_qpos_6, dtype=np.float64)
+            arm_qpos = start_actuated[:6].copy()
+
+            for step in range(max(1, animate_steps)):
+                alpha = float(step + 1) / float(max(1, animate_steps))
+                wrist_pose = interpolate_pose(start_wrist_pose, target_wrist_pose, alpha)
+                hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
+                arm_qpos = solve_arm_wrist_palm_ik(
+                    runtime=runtime,
+                    target_wrist_pose_world=wrist_pose,
+                    initial_arm_qpos=arm_qpos,
+                    hand_qpos=hand_qpos,
+                    iterations=config.conversion.arm_ik_iterations,
+                    damping=config.conversion.arm_ik_damping,
+                )
+                runtime.set_robot_actuated_qpos(np.concatenate([arm_qpos, hand_qpos]))
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+            final_actuated = np.concatenate([arm_qpos, target_hand_qpos])
+            runtime.settle_actuated_pose(final_actuated, PROJECTION_SETTLE_STEPS)
+            for _ in range(max(1, hold_steps)):
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+            for _ in range(max(0, pause_steps)):
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+
+def play_samples_dynamic(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    selected_samples: list[tuple[int, PoseDrivenSample]],
+    samples_path: Path,
+    animate_steps: int,
+    hold_steps: int,
+    pause_steps: int,
+    sim_substeps: int,
+) -> None:
+    with mujoco_viewer.launch_passive(runtime.model, runtime.data) as viewer:
+        configure_camera(viewer.cam)
+        for sample_index, sample in selected_samples:
+            print_sample_summary(sample_index, sample, samples_path)
+            runtime.reset()
+            runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
+
+            start_actuated = runtime.get_actuated_qpos()
+            start_wrist_pose = wrist_pose_from_semantic_sites(runtime.get_semantic_sites_world())
+            target_wrist_pose = np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)
+            target_hand_qpos = np.asarray(sample.hand_qpos_6, dtype=np.float64)
+            ctrl_target = start_actuated.copy()
+            arm_qpos = start_actuated[:6].copy()
+
+            for step in range(max(1, animate_steps)):
+                alpha = float(step + 1) / float(max(1, animate_steps))
+                wrist_pose = interpolate_pose(start_wrist_pose, target_wrist_pose, alpha)
+                hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
+                arm_qpos = solve_arm_wrist_palm_ik(
+                    runtime=runtime,
+                    target_wrist_pose_world=wrist_pose,
+                    initial_arm_qpos=arm_qpos,
+                    hand_qpos=hand_qpos,
+                    iterations=config.conversion.arm_ik_iterations,
+                    damping=config.conversion.arm_ik_damping,
+                )
+                ctrl_target = runtime.clamp_actuated(np.concatenate([arm_qpos, hand_qpos]))
+                runtime.step(ctrl_target, max(1, sim_substeps))
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+            final_ctrl = runtime.clamp_actuated(np.concatenate([arm_qpos, target_hand_qpos]))
+            for _ in range(max(1, hold_steps)):
+                runtime.step(final_ctrl, max(1, sim_substeps))
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+            for _ in range(max(0, pause_steps)):
+                runtime.step(final_ctrl, max(1, sim_substeps))
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+
 def main() -> None:
     configure_local_runtime_env()
     args = build_arg_parser().parse_args()
@@ -308,16 +443,45 @@ def main() -> None:
         samples_path = pose_driven_samples_path(config)
         samples = load_pose_driven_samples(samples_path) if samples_path.exists() else prepare_pose_driven_samples(config)
     samples_path = pose_driven_samples_path(config)
-    sample_index, sample = select_sample(samples, args)
-    print_sample_summary(sample_index, sample, samples_path)
+    selected_samples = select_samples(samples, args)
+    sample_index, sample = selected_samples[0]
+    if not args.all:
+        print_sample_summary(sample_index, sample, samples_path)
 
     scene_xml, metadata_path = build_training_scene(config)
     runtime = RobotSceneModel(config, scene_xml=scene_xml, metadata_path=metadata_path)
 
     if args.preview:
+        if args.all:
+            raise ValueError("--preview does not support --all. Please preview one sample at a time.")
         set_final_target_pose(runtime, config, sample)
         output = render_preview(runtime.model, runtime.data, args.width, args.height, args.output)
         print(f"Preview written to: {output}")
+        return
+
+    if args.all and args.kinematic:
+        play_samples_kinematic(
+            runtime,
+            config,
+            selected_samples,
+            samples_path,
+            args.animate_steps,
+            args.hold_steps,
+            args.pause_steps,
+        )
+        return
+
+    if args.all:
+        play_samples_dynamic(
+            runtime,
+            config,
+            selected_samples,
+            samples_path,
+            args.animate_steps,
+            args.hold_steps,
+            args.pause_steps,
+            args.sim_substeps,
+        )
         return
 
     if args.kinematic:

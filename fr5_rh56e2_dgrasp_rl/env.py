@@ -46,6 +46,7 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self,
         config: TaskConfig | None = None,
         drop_table_after_pregrasp: bool = True,
+        freeze_control_after_pregrasp: bool = False,
         deterministic_goal_index: int | None = None,
     ) -> None:
         super().__init__()
@@ -54,6 +55,7 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self.runtime = RobotSceneModel(self.config, scene_xml=scene_xml, metadata_path=metadata_path)
         self.goals = self._load_goals()
         self.drop_table_after_pregrasp = drop_table_after_pregrasp
+        self.freeze_control_after_pregrasp = freeze_control_after_pregrasp
         self.deterministic_goal_index = deterministic_goal_index
         self.current_goal: PoseDrivenSample | None = None
         self.current_goal_index = 0
@@ -62,12 +64,18 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self.current_hand_target_qpos = self.runtime.get_actuated_qpos()[6:].copy()
         self.pregrasp_wrist_pose_world = self.current_wrist_target_pose.copy()
         self.pregrasp_hand_qpos = self.current_hand_target_qpos.copy()
+        self.eval_arm_hold_kp_scale = 2.5
+        self.eval_arm_support_force_world = np.array([0.0, 0.0, self.config.object_mass_kg * 10.0], dtype=np.float64)
         self.previous_action = np.zeros(12, dtype=np.float64)
         self.step_count = 0
         self.table_dropped = False
+        self.control_frozen = False
         self.slipped = False
         self.first_slip_step: int | None = None
         self.last_object_pos = np.zeros(3, dtype=np.float64)
+        self.frozen_ctrl = self.current_ctrl.copy()
+        self.frozen_wrist_target_pose = self.current_wrist_target_pose.copy()
+        self.frozen_hand_target_qpos = self.current_hand_target_qpos.copy()
         self.metrics = EpisodeMetrics()
         self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(119,), dtype=np.float32)
@@ -459,6 +467,7 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         self.runtime.reset()
+        self.runtime.set_arm_hold_mode(False)
         forced_goal_index = None if options is None else options.get("goal_index")
         self.current_goal_index = self._choose_goal_index() if forced_goal_index is None else int(forced_goal_index)
         self.current_goal = self._goal_from_index(self.current_goal_index)
@@ -483,11 +492,15 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         self.current_hand_target_qpos = self.current_ctrl[6:].copy()
         self.step_count = 0
         self.table_dropped = False
+        self.control_frozen = False
         self.slipped = False
         self.first_slip_step = None
         self.previous_action = np.zeros(12, dtype=np.float64)
         self.metrics = EpisodeMetrics()
         self.last_object_pos = self.runtime.get_object_pose()[:3].copy()
+        self.frozen_ctrl = self.current_ctrl.copy()
+        self.frozen_wrist_target_pose = self.current_wrist_target_pose.copy()
+        self.frozen_hand_target_qpos = self.current_hand_target_qpos.copy()
 
         obs = self._observation()
         info = {
@@ -507,27 +520,43 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
         hand_delta = action[6:] * self.config.action_delta_hand
 
         object_pose = self.runtime.get_object_pose()
-        guided_wrist_target_pose, guided_hand_target_qpos = self._guided_targets(object_pose)
+        support_force_world = None
+        if self.control_frozen:
+            unclamped_hand_target_qpos = self.runtime.get_actuated_qpos()[6:] + hand_delta
+            self.current_wrist_target_pose = self.frozen_wrist_target_pose.copy()
+            self.current_hand_target_qpos = self.runtime.clamp_hand(unclamped_hand_target_qpos)
+            self.current_ctrl = self._solve_actuated_targets(
+                wrist_pose_world=self.current_wrist_target_pose,
+                hand_qpos=self.current_hand_target_qpos,
+                initial_arm_qpos=self.current_ctrl[:6],
+            )
+            support_force_world = self.eval_arm_support_force_world
+        else:
+            guided_wrist_target_pose, guided_hand_target_qpos = self._guided_targets(object_pose)
+            unclamped_hand_target_qpos = guided_hand_target_qpos + hand_delta
+            self.current_wrist_target_pose = apply_local_pose_delta(
+                guided_wrist_target_pose,
+                wrist_translation_delta,
+                wrist_rotation_delta,
+            )
+            self.current_hand_target_qpos = self.runtime.clamp_hand(unclamped_hand_target_qpos)
 
-        unclamped_hand_target_qpos = guided_hand_target_qpos + hand_delta
-        self.current_wrist_target_pose = apply_local_pose_delta(
-            guided_wrist_target_pose,
-            wrist_translation_delta,
-            wrist_rotation_delta,
-        )
-        self.current_hand_target_qpos = self.runtime.clamp_hand(unclamped_hand_target_qpos)
-
-        self.current_ctrl = self._solve_actuated_targets(
-            wrist_pose_world=self.current_wrist_target_pose,
-            hand_qpos=self.current_hand_target_qpos,
-            initial_arm_qpos=self.current_ctrl[:6],
-        )
-        self.runtime.step(self.current_ctrl, self.config.frame_skip)
+            self.current_ctrl = self._solve_actuated_targets(
+                wrist_pose_world=self.current_wrist_target_pose,
+                hand_qpos=self.current_hand_target_qpos,
+                initial_arm_qpos=self.current_ctrl[:6],
+            )
+        self.runtime.step(self.current_ctrl, self.config.frame_skip, arm_support_force_world=support_force_world)
         self.step_count += 1
 
         if self.drop_table_after_pregrasp and not self.table_dropped and self.step_count >= self.config.pre_grasp_steps:
             self.runtime.set_table_height(0.0)
             self.table_dropped = True
+            if self.freeze_control_after_pregrasp:
+                self.control_frozen = True
+                self.frozen_wrist_target_pose = self.current_wrist_target_pose.copy()
+                self.frozen_hand_target_qpos = self.current_hand_target_qpos.copy()
+                self.runtime.set_arm_hold_mode(True, arm_kp_scale=self.eval_arm_hold_kp_scale)
 
         current_object_pos = self.runtime.get_object_pose()[:3].copy()
         displacement = float(np.linalg.norm(current_object_pos - self.last_object_pos))
@@ -549,6 +578,7 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
             "label_idx": self.current_goal.label_idx if self.current_goal is not None else -1,
             "step_displacement": displacement,
             "table_dropped": float(self.table_dropped),
+            "control_frozen": float(self.control_frozen),
             "goal_valid_execution": float(self.current_goal.valid_execution) if self.current_goal is not None else 0.0,
             "hand_target_clip_fraction": float(
                 np.mean(np.abs(self.current_hand_target_qpos - unclamped_hand_target_qpos) > 1e-9)
@@ -597,19 +627,27 @@ class FR5LowLevelGraspEnv(gym.Env[np.ndarray, np.ndarray]):
 def create_env(
     config: TaskConfig,
     drop_table_after_pregrasp: bool = True,
+    freeze_control_after_pregrasp: bool = False,
     deterministic_goal_index: int | None = None,
 ) -> FR5LowLevelGraspEnv:
     return FR5LowLevelGraspEnv(
         config=config,
         drop_table_after_pregrasp=drop_table_after_pregrasp,
+        freeze_control_after_pregrasp=freeze_control_after_pregrasp,
         deterministic_goal_index=deterministic_goal_index,
     )
 
 
-def make_env(config: TaskConfig, drop_table_after_pregrasp: bool = True, deterministic_goal_index: int | None = None):
+def make_env(
+    config: TaskConfig,
+    drop_table_after_pregrasp: bool = True,
+    freeze_control_after_pregrasp: bool = False,
+    deterministic_goal_index: int | None = None,
+):
     return partial(
         create_env,
         config=config,
         drop_table_after_pregrasp=drop_table_after_pregrasp,
+        freeze_control_after_pregrasp=freeze_control_after_pregrasp,
         deterministic_goal_index=deterministic_goal_index,
     )

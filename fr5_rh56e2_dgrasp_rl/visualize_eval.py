@@ -78,8 +78,11 @@ def _set_overlay(
             "Step",
             "Phase",
             "Table Dropped",
+            "Wrist Frozen",
             "Slipped",
             "Reward",
+            "Penetration",
+            "Hard/Hybrid",
             "End Reason",
         ]
     )
@@ -91,10 +94,16 @@ def _set_overlay(
             step_text,
             _phase_name(env),
             "yes" if env.table_dropped else "no",
+            "yes" if env.control_frozen else "no",
             "yes" if env.slipped else "no",
             f"{(env.metrics.reward_sum if done and episode_reward is None else (episode_reward if episode_reward is not None else last_reward)):.3f}"
             if done
             else f"{last_reward:.3f}",
+            f"{env.runtime.get_contact_diagnostics_12()['max_penetration_m']:.4f} m",
+            (
+                f"{int(np.sum(env.runtime.get_contact_diagnostics_12()['hard_mask'] > 0.5))}/"
+                f"{int(np.sum(env.runtime.get_contact_diagnostics_12()['hybrid_mask'] > 0.5))}"
+            ),
             _end_reason(env, done),
         ]
     )
@@ -106,7 +115,11 @@ def visualize_eval_main(args: argparse.Namespace | None = None) -> None:
 
     config = TaskConfig.from_json(parsed.config)
     device = resolve_torch_device(parsed.device)
-    env = FR5LowLevelGraspEnv(config=config, drop_table_after_pregrasp=config.eval.drop_table_after_pregrasp)
+    env = FR5LowLevelGraspEnv(
+        config=config,
+        drop_table_after_pregrasp=config.eval.drop_table_after_pregrasp,
+        freeze_control_after_pregrasp=config.eval.freeze_control_after_pregrasp,
+    )
 
     checkpoint = torch.load(parsed.checkpoint, map_location=device)
     model = ActorCritic(checkpoint["obs_dim"], checkpoint["act_dim"], config.ppo.hidden_sizes)

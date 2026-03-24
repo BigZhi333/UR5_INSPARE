@@ -7,6 +7,7 @@
     0.089,
     0.175
   ],
+  "object_geom_type": "box",
   "object_mass_kg": 0.514,
   "table_center": [
     0.68,
@@ -24,8 +25,8 @@
     0.002
   ],
   "default_object_pose": [
-    0.62,
-    -0.54,
+    0.74,
+    -0.64,
     0.5875,
     1.0,
     0.0,
@@ -33,8 +34,8 @@
     0.0
   ],
   "workspace_translation": [
-    0.08,
-    -0.74,
+    0.18,
+    -0.84,
     0.03
   ],
   "control_dt": 0.03,
@@ -86,6 +87,7 @@
   "eval": {
     "num_episodes": 20,
     "drop_table_after_pregrasp": true,
+    "freeze_control_after_pregrasp": true,
     "success_height_threshold_m": 0.1,
     "save_trajectories": true
   },

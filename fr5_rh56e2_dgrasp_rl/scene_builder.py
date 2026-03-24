@@ -17,8 +17,169 @@ from .paths import (
 from .task_config import TaskConfig
 
 
-DEFAULT_SCENE_XML_NAME = "fr5_rh56e2_sugar_box_scene.xml"
-DEFAULT_SCENE_METADATA_NAME = "fr5_rh56e2_sugar_box_metadata.json"
+SCENE_BUILD_VERSION = 7
+OBJECT_BODY_NAME = "task_object"
+OBJECT_JOINT_NAME = "task_object_freejoint"
+OBJECT_COLLISION_NAME = "task_object_collision"
+OBJECT_VISUAL_NAME = "task_object_visual"
+OBJECT_VISUAL_MESH_NAME = "task_object_visual_mesh"
+OBJECT_CENTER_SITE_NAME = "task_object_center"
+
+HAND_COLLISION_PROXY_ATTRS = {
+    "contype": "1",
+    "conaffinity": "1",
+    "condim": "6",
+    "friction": "1.1 0.02 0.002",
+    "margin": "0.0015",
+    "rgba": "0.1 0.7 0.2 0.08",
+}
+
+HAND_COLLISION_PROXIES: dict[str, list[dict[str, str]]] = {
+    "rh56e2_right_thumb_1": [],
+    "j6_Link": [
+        {
+            "name": "proxy_palm_main",
+            "type": "box",
+            "pos": "0.0000 0.0045 0.184",
+            "quat": "-0.707107 -2.61376e-06 -2.61376e-06 -0.707107",
+            "size": "0.024 0.028 0.016",
+        },
+        {
+            "name": "proxy_palm_upper",
+            "type": "box",
+            "pos": "-0.00036753 0.012296 0.221",
+            "quat": "3.90296e-06 -1.32455e-06 -0.707108 -0.707105",
+            "size": "0.018 0.02 0.008",
+        },
+    ],
+    "rh56e2_right_thumb_2": [
+        {
+            "name": "proxy_thumb_proximal",
+            "type": "capsule",
+            "fromto": "-0.008 0.012 0.003  -0.047 0.031 -0.006",
+            "size": "0.009",
+        },
+    ],
+    "rh56e2_right_thumb_3": [
+        {
+            "name": "proxy_thumb_middle",
+            "type": "capsule",
+            "fromto": "-0.002 0.006 0.004  -0.017 0.017 0.001",
+            "size": "0.007",
+        },
+    ],
+    "rh56e2_right_thumb_4": [
+        {
+            "name": "proxy_thumb_distal",
+            "type": "capsule",
+            "fromto": "-0.003 0.007 0.004  -0.017 0.025 0.007",
+            "size": "0.006",
+        },
+    ],
+    "rh56e2_right_index_1": [
+        {
+            "name": "proxy_index_proximal",
+            "type": "capsule",
+            "fromto": "0.004 0.006 0.006  0.008 0.028 0.006",
+            "size": "0.007",
+        },
+    ],
+    "rh56e2_right_index_2": [
+        {
+            "name": "proxy_index_distal",
+            "type": "capsule",
+            "fromto": "0.006 0.008 0.006  0.0085 0.05 0.006",
+            "size": "0.006",
+        },
+    ],
+    "rh56e2_right_middle_1": [
+        {
+            "name": "proxy_middle_proximal",
+            "type": "capsule",
+            "fromto": "0.0045 0.006 0.006  0.009 0.029 0.006",
+            "size": "0.0075",
+        },
+    ],
+    "rh56e2_right_middle_2": [
+        {
+            "name": "proxy_middle_distal",
+            "type": "capsule",
+            "fromto": "0.007 0.008 0.006  0.0095 0.053 0.006",
+            "size": "0.0065",
+        },
+    ],
+    "rh56e2_right_ring_1": [
+        {
+            "name": "proxy_ring_proximal",
+            "type": "capsule",
+            "fromto": "0.004 0.006 0.006  0.008 0.028 0.006",
+            "size": "0.007",
+        },
+    ],
+    "rh56e2_right_ring_2": [
+        {
+            "name": "proxy_ring_distal",
+            "type": "capsule",
+            "fromto": "0.006 0.008 0.006  0.0085 0.05 0.006",
+            "size": "0.006",
+        },
+    ],
+    "rh56e2_right_little_1": [
+        {
+            "name": "proxy_little_proximal",
+            "type": "capsule",
+            "fromto": "0.0035 0.006 0.006  0.0068 0.026 0.006",
+            "size": "0.0065",
+        },
+    ],
+    "rh56e2_right_little_2": [
+        {
+            "name": "proxy_little_distal",
+            "type": "capsule",
+            "fromto": "0.0045 0.007 0.006  0.0065 0.041 0.006",
+            "size": "0.0055",
+        },
+    ],
+}
+
+HAND_JOINT_FORCE_LIMITS = {
+    "rh56e2_right_thumb_1_joint": 8.0,
+    "rh56e2_right_thumb_2_joint": 6.0,
+    "rh56e2_right_thumb_3_joint": 5.0,
+    "rh56e2_right_thumb_4_joint": 4.0,
+    "rh56e2_right_index_1_joint": 6.0,
+    "rh56e2_right_index_2_joint": 4.0,
+    "rh56e2_right_middle_1_joint": 6.0,
+    "rh56e2_right_middle_2_joint": 4.0,
+    "rh56e2_right_ring_1_joint": 6.0,
+    "rh56e2_right_ring_2_joint": 4.0,
+    "rh56e2_right_little_1_joint": 5.0,
+    "rh56e2_right_little_2_joint": 3.5,
+}
+
+HAND_ACTUATOR_KP = {
+    "rh56e2_right_thumb_1_joint_act": 42.0,
+    "rh56e2_right_thumb_2_joint_act": 38.0,
+    "rh56e2_right_index_1_joint_act": 34.0,
+    "rh56e2_right_middle_1_joint_act": 34.0,
+    "rh56e2_right_ring_1_joint_act": 34.0,
+    "rh56e2_right_little_1_joint_act": 30.0,
+}
+
+HAND_JOINT_DAMPING = {
+    "rh56e2_right_thumb_1_joint": 0.25,
+    "rh56e2_right_thumb_2_joint": 0.18,
+    "rh56e2_right_thumb_3_joint": 0.12,
+    "rh56e2_right_thumb_4_joint": 0.10,
+    "rh56e2_right_index_1_joint": 0.16,
+    "rh56e2_right_index_2_joint": 0.10,
+    "rh56e2_right_middle_1_joint": 0.16,
+    "rh56e2_right_middle_2_joint": 0.10,
+    "rh56e2_right_ring_1_joint": 0.16,
+    "rh56e2_right_ring_2_joint": 0.10,
+    "rh56e2_right_little_1_joint": 0.14,
+    "rh56e2_right_little_2_joint": 0.09,
+}
 
 
 def _import_base_builder():
@@ -73,6 +234,13 @@ def _remove_named(parent: ET.Element, tag: str, name: str) -> None:
         parent.remove(element)
 
 
+def _find_body(worldbody: ET.Element, name: str) -> ET.Element | None:
+    for body in worldbody.iter("body"):
+        if body.attrib.get("name") == name:
+            return body
+    return None
+
+
 def _set_mesh_paths_absolute(root: ET.Element, base_scene_xml: Path) -> None:
     asset = root.find("asset")
     if asset is None:
@@ -91,20 +259,66 @@ def _add_semantic_site(body: ET.Element, name: str, pos: str, rgba: str = "0.2 0
     site.attrib.update({"pos": pos, "size": "0.006", "rgba": rgba, "type": "sphere"})
 
 
+def _configure_hand_collision_proxies(worldbody: ET.Element) -> None:
+    for body in worldbody.iter("body"):
+        body_name = body.attrib.get("name", "")
+        if body_name == "j6_Link" or body_name.startswith("rh56e2_"):
+            for geom in body.findall("geom"):
+                if geom.attrib.get("type") == "mesh":
+                    geom.attrib["contype"] = "0"
+                    geom.attrib["conaffinity"] = "0"
+
+    for body_name, proxy_defs in HAND_COLLISION_PROXIES.items():
+        body = _find_body(worldbody, body_name)
+        if body is None:
+            continue
+        for geom in body.findall("geom"):
+            if geom.attrib.get("name", "").startswith("proxy_"):
+                geom.attrib.update(HAND_COLLISION_PROXY_ATTRS)
+        for proxy_def in proxy_defs:
+            proxy = _ensure_named(body, "geom", proxy_def["name"])
+            proxy.attrib.update(HAND_COLLISION_PROXY_ATTRS)
+            proxy.attrib.update(proxy_def)
+
+
 def _copy_obj_without_materials(source_obj: Path, target_obj: Path) -> None:
     lines = source_obj.read_text(encoding="utf-8", errors="ignore").splitlines()
     filtered = [line for line in lines if not line.startswith("mtllib ") and not line.startswith("usemtl ")]
     target_obj.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 
 
+def _configure_hand_actuation(root: ET.Element) -> None:
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        return
+    for body in worldbody.iter("body"):
+        for joint in body.findall("joint"):
+            joint_name = joint.attrib.get("name")
+            if joint_name in HAND_JOINT_FORCE_LIMITS:
+                limit = HAND_JOINT_FORCE_LIMITS[joint_name]
+                joint.attrib["actuatorfrcrange"] = f"{-limit:.8g} {limit:.8g}"
+            if joint_name in HAND_JOINT_DAMPING:
+                joint.attrib["damping"] = f"{HAND_JOINT_DAMPING[joint_name]:.8g}"
+
+    actuator = root.find("actuator")
+    if actuator is None:
+        return
+    for position in actuator.findall("position"):
+        actuator_name = position.attrib.get("name")
+        if actuator_name in HAND_ACTUATOR_KP:
+            position.attrib["kp"] = f"{HAND_ACTUATOR_KP[actuator_name]:.8g}"
+
+
 def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tuple[Path, Path]:
     dirs = ensure_runtime_dirs()
-    scene_xml_path = dirs["build"] / DEFAULT_SCENE_XML_NAME
-    metadata_path = dirs["build"] / DEFAULT_SCENE_METADATA_NAME
+    scene_xml_path = config.default_scene_xml
+    metadata_path = config.default_scene_metadata
 
     if not force_rebuild and scene_xml_path.exists() and metadata_path.exists():
         existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         matches_config = (
+            existing_metadata.get("scene_build_version") == SCENE_BUILD_VERSION
+            and
             existing_metadata.get("table_center") == config.table_center
             and existing_metadata.get("table_size") == config.table_size
             and existing_metadata.get("default_object_pose") == config.default_object_pose
@@ -153,14 +367,14 @@ def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tup
     asset = root.find("asset")
     if asset is None:
         asset = ET.SubElement(root, "asset")
-    sugar_mesh = _ensure_named(asset, "mesh", "sugar_box_visual_mesh")
-    sugar_mesh.attrib.update(
+    object_visual_mesh = _ensure_named(asset, "mesh", OBJECT_VISUAL_MESH_NAME)
+    object_visual_mesh.attrib.update(
         {
             "file": str(object_mesh_copy.resolve())
         }
     )
 
-    object_body = _ensure_named(worldbody, "body", "sugar_box")
+    object_body = _ensure_named(worldbody, "body", OBJECT_BODY_NAME)
     object_body.attrib.update(
         {
             "pos": " ".join(str(v) for v in config.default_object_pose[:3]),
@@ -168,33 +382,49 @@ def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tup
         }
     )
     for child in list(object_body):
-        if child.tag == "freejoint" and child.attrib.get("name") != "sugar_box_freejoint":
+        if child.tag == "freejoint" and child.attrib.get("name") != OBJECT_JOINT_NAME:
             object_body.remove(child)
-    freejoint = _ensure_named(object_body, "freejoint", "sugar_box_freejoint")
-    freejoint.attrib.update({"name": "sugar_box_freejoint"})
-    collision = _ensure_named(object_body, "geom", "sugar_box_collision")
-    half_extents = [0.5 * value for value in config.object_dims_m]
-    collision.attrib.update(
-        {
-            "type": "box",
-            "size": " ".join(str(v) for v in half_extents),
-            "mass": f"{config.object_mass_kg:.8g}",
-            "rgba": "0 0 0 0",
-            "friction": "1.1 0.02 0.001",
-            "condim": "6",
-        }
-    )
-    visual = _ensure_named(object_body, "geom", "sugar_box_visual")
+    freejoint = _ensure_named(object_body, "freejoint", OBJECT_JOINT_NAME)
+    freejoint.attrib.update({"name": OBJECT_JOINT_NAME})
+    collision = _ensure_named(object_body, "geom", OBJECT_COLLISION_NAME)
+    collision_attrs = {
+        "mass": f"{config.object_mass_kg:.8g}",
+        "rgba": "0 0 0 0",
+        "friction": "1.1 0.02 0.001",
+        "condim": "6",
+        "margin": "0.0015",
+    }
+    if config.object_geom_type == "cylinder":
+        radius = float(config.object_dims_m[0])
+        height = float(config.object_dims_m[1])
+        collision_attrs.update(
+            {
+                "type": "cylinder",
+                "size": f"{radius:.8g} {0.5 * height:.8g}",
+            }
+        )
+    else:
+        half_extents = [0.5 * value for value in config.object_dims_m]
+        collision_attrs.update(
+            {
+                "type": "box",
+                "size": " ".join(str(v) for v in half_extents),
+            }
+        )
+    collision.attrib.update(collision_attrs)
+    visual = _ensure_named(object_body, "geom", OBJECT_VISUAL_NAME)
     visual.attrib.update(
         {
             "type": "mesh",
-            "mesh": "sugar_box_visual_mesh",
+            "mesh": OBJECT_VISUAL_MESH_NAME,
             "contype": "0",
             "conaffinity": "0",
+            "density": "0",
+            "mass": "0",
             "rgba": "0.9 0.9 0.9 1",
         }
     )
-    object_site = _ensure_named(object_body, "site", "sugar_box_center")
+    object_site = _ensure_named(object_body, "site", OBJECT_CENTER_SITE_NAME)
     object_site.attrib.update({"type": "sphere", "size": "0.008", "rgba": "0.9 0.2 0.2 1"})
 
     j6_body = None
@@ -204,6 +434,9 @@ def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tup
             break
     if j6_body is None:
         raise ValueError("Could not find j6_Link in base scene.")
+
+    _configure_hand_collision_proxies(worldbody)
+    _configure_hand_actuation(root)
 
     _add_semantic_site(j6_body, "wrist_mount", "0 0 0.109013")
     _add_semantic_site(j6_body, "palm_center", "-0.00036753 0.012296 0.228614")
@@ -234,6 +467,7 @@ def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tup
 
     metadata = {
         **base_metadata,
+        "scene_build_version": SCENE_BUILD_VERSION,
         "scene_xml": str(scene_xml_path),
         "scene_metadata": str(metadata_path),
         "semantic_sites": [
@@ -245,13 +479,14 @@ def build_training_scene(config: TaskConfig, force_rebuild: bool = False) -> tup
             "ring_tip",
             "little_tip",
         ],
-        "object_body_name": "sugar_box",
-        "object_joint_name": "sugar_box_freejoint",
-        "object_center_site": "sugar_box_center",
+        "object_body_name": OBJECT_BODY_NAME,
+        "object_joint_name": OBJECT_JOINT_NAME,
+        "object_center_site": OBJECT_CENTER_SITE_NAME,
         "table_geom_name": "grasp_table",
         "table_center": config.table_center,
         "table_size": config.table_size,
         "object_dims_m": config.object_dims_m,
+        "object_geom_type": config.object_geom_type,
         "default_object_pose": config.default_object_pose,
         "contact_group_bodies": {
             "palm": ["j6_Link"],

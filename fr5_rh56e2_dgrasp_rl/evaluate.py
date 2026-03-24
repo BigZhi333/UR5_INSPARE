@@ -29,7 +29,11 @@ def evaluate_main(args: argparse.Namespace | None = None) -> Path:
 
     config = TaskConfig.from_json(parsed.config)
     device = resolve_torch_device(parsed.device)
-    env = FR5LowLevelGraspEnv(config=config, drop_table_after_pregrasp=config.eval.drop_table_after_pregrasp)
+    env = FR5LowLevelGraspEnv(
+        config=config,
+        drop_table_after_pregrasp=config.eval.drop_table_after_pregrasp,
+        freeze_control_after_pregrasp=config.eval.freeze_control_after_pregrasp,
+    )
     checkpoint = torch.load(parsed.checkpoint, map_location=device)
     model = ActorCritic(checkpoint["obs_dim"], checkpoint["act_dim"], config.ppo.hidden_sizes)
     model.load_state_dict(checkpoint["model_state_dict"])

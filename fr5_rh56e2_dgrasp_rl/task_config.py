@@ -28,6 +28,7 @@ class PPOConfig:
 class EvalConfig:
     num_episodes: int
     drop_table_after_pregrasp: bool
+    freeze_control_after_pregrasp: bool
     success_height_threshold_m: float
     save_trajectories: bool
 
@@ -50,6 +51,7 @@ class TaskConfig:
     object_id: int
     object_name: str
     object_dims_m: list[float]
+    object_geom_type: str
     object_mass_kg: float
     table_center: list[float]
     table_size: list[float]
@@ -88,11 +90,11 @@ class TaskConfig:
 
     @property
     def default_scene_xml(self) -> Path:
-        return self.project_dir / "build" / "fr5_rh56e2_sugar_box_scene.xml"
+        return self.project_dir / "build" / f"fr5_rh56e2_{self.object_name}_scene.xml"
 
     @property
     def default_scene_metadata(self) -> Path:
-        return self.project_dir / "build" / "fr5_rh56e2_sugar_box_metadata.json"
+        return self.project_dir / "build" / f"fr5_rh56e2_{self.object_name}_metadata.json"
 
     @property
     def converted_goals_path(self) -> Path:
@@ -105,6 +107,7 @@ class TaskConfig:
     @classmethod
     def from_json(cls, path: Path) -> "TaskConfig":
         payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.setdefault("object_geom_type", "box")
         payload["ppo"] = PPOConfig(**payload["ppo"])
         payload["eval"] = EvalConfig(**payload["eval"])
         payload["conversion"] = ConversionConfig(**payload["conversion"])

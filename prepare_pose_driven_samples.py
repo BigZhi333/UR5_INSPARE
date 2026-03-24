@@ -42,6 +42,22 @@ def main() -> None:
         [sample.fit_error.get("projected_matched_target_contacts", 0.0) for sample in samples],
         dtype=np.float64,
     )
+    hold_drop = np.asarray(
+        [sample.fit_error.get("projected_hold_object_drop_m", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
+    hold_hybrid_groups = np.asarray(
+        [sample.fit_error.get("projected_hold_hybrid_contact_group_count", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
+    hold_hard_groups = np.asarray(
+        [sample.fit_error.get("projected_hold_hard_contact_group_count", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
+    hold_opposition = np.asarray(
+        [sample.fit_error.get("projected_hold_has_thumb_opposition", 0.0) for sample in samples],
+        dtype=np.float64,
+    )
     required_contacts = np.asarray(
         [sample.fit_error.get("projected_required_target_contacts", 0.0) for sample in samples],
         dtype=np.float64,
@@ -69,6 +85,17 @@ def main() -> None:
         "Matched target contacts after projection: "
         f"mean={matched_contacts.mean():.2f}, std={matched_contacts.std():.2f}, "
         f"min={matched_contacts.min():.0f}, max={matched_contacts.max():.0f}"
+    )
+    print(
+        "Hold-test object drop (m): "
+        f"mean={hold_drop.mean():.4f}, std={hold_drop.std():.4f}, "
+        f"min={hold_drop.min():.4f}, max={hold_drop.max():.4f}"
+    )
+    print(
+        "Hold-test contact groups: "
+        f"hybrid_mean={hold_hybrid_groups.mean():.2f}, "
+        f"hard_mean={hold_hard_groups.mean():.2f}, "
+        f"thumb_opposition={(hold_opposition > 0.5).sum()}/{len(samples)}"
     )
     print(
         "Contact buckets: "

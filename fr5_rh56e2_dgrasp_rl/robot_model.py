@@ -8,7 +8,12 @@ import mujoco
 import numpy as np
 
 from .scene_builder import build_training_scene
-from .semantics import SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M, SEMANTIC_CONTACT_NAMES
+from .semantics import (
+    GENHAND_CONTACT_FAMILY_NAMES,
+    GENHAND_ROBOT_CONTACT_CANDIDATES,
+    SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M,
+    SEMANTIC_CONTACT_NAMES,
+)
 from .task_config import TaskConfig
 
 
@@ -47,6 +52,8 @@ class RobotSceneModel:
             "little_proximal": ["rh56e2_right_little_1"],
             "little_distal": ["rh56e2_right_little_2"],
         }
+        self.arm_link_names = ["j1_Link", "j2_Link", "j3_Link", "j4_Link", "j5_Link", "j6_Link"]
+        self.arm_sweep_link_pairs = [("j2_Link", "j3_Link"), ("j3_Link", "j4_Link"), ("j4_Link", "j5_Link"), ("j5_Link", "j6_Link")]
         self.object_body_name = str(self.metadata["object_body_name"])
         self.object_joint_name = str(self.metadata["object_joint_name"])
         self.object_center_site = str(self.metadata["object_center_site"])
@@ -85,6 +92,7 @@ class RobotSceneModel:
             name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
             for name in {
                 self.object_body_name,
+                *self.arm_link_names,
                 "j6_Link",
                 *self.contact_group_bodies["thumb"],
                 *self.contact_group_bodies["index"],
@@ -127,6 +135,19 @@ class RobotSceneModel:
             ]
             for group, body_ids in self.contact_group_body_ids_12.items()
         }
+        self.contact_candidate_names: list[str] = []
+        self.contact_candidate_geom_ids: list[int] = []
+        self.contact_candidate_family_indices: list[int] = []
+        family_index_by_name = {
+            family_name: family_index for family_index, family_name in enumerate(GENHAND_CONTACT_FAMILY_NAMES)
+        }
+        for geom_name, family_name in GENHAND_ROBOT_CONTACT_CANDIDATES:
+            geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+            if geom_id == -1:
+                continue
+            self.contact_candidate_names.append(geom_name)
+            self.contact_candidate_geom_ids.append(int(geom_id))
+            self.contact_candidate_family_indices.append(int(family_index_by_name[family_name]))
 
         self.actuated_lower = np.array([self.joint_limits[name][0] for name in self.actuated_joints], dtype=np.float64)
         self.actuated_upper = np.array([self.joint_limits[name][1] for name in self.actuated_joints], dtype=np.float64)
@@ -139,6 +160,8 @@ class RobotSceneModel:
             for index, joint_name in enumerate(self.movable_joints)
         }
         self.home_actuated = self.home_ctrl.copy()
+        self.default_actuator_kp = self.model.actuator_gainprm[:, 0].copy()
+        self.default_actuator_bias_kp = (-self.model.actuator_biasprm[:, 1]).copy()
         self.reset()
 
     def reset(self) -> None:
@@ -151,8 +174,32 @@ class RobotSceneModel:
         self.set_object_pose(self.default_object_pose)
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = self.home_ctrl
+        self.data.qfrc_applied[:] = 0.0
+        self.set_arm_hold_mode(False)
         self.set_table_height(self.original_table_center_z)
         mujoco.mj_forward(self.model, self.data)
+
+    def set_arm_hold_mode(self, enabled: bool, arm_kp_scale: float = 1.0) -> None:
+        scale = float(arm_kp_scale if enabled else 1.0)
+        arm_count = len(self.arm_joints)
+        self.model.actuator_gainprm[:arm_count, 0] = self.default_actuator_kp[:arm_count] * scale
+        self.model.actuator_biasprm[:arm_count, 1] = -self.default_actuator_kp[:arm_count] * scale
+
+    def _arm_support_torque(self, force_world: np.ndarray) -> np.ndarray:
+        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+        jacr = np.zeros((3, self.model.nv), dtype=np.float64)
+        mujoco.mj_jacSite(
+            self.model,
+            self.data,
+            jacp,
+            jacr,
+            self.site_id_by_name["wrist_mount"],
+        )
+        tau = jacp.T @ np.asarray(force_world, dtype=np.float64)
+        qfrc = np.zeros(self.model.nv, dtype=np.float64)
+        arm_dof_indices = [self.qvel_index_by_joint[name] for name in self.arm_joints]
+        qfrc[arm_dof_indices] = tau[arm_dof_indices]
+        return qfrc
 
     def clamp_actuated(self, values: np.ndarray) -> np.ndarray:
         return np.minimum(np.maximum(values, self.actuated_lower), self.actuated_upper)
@@ -246,6 +293,74 @@ class RobotSceneModel:
     def get_semantic_sites_world(self) -> np.ndarray:
         return np.vstack([self.data.site_xpos[self.site_id_by_name[name]].copy() for name in self.semantic_sites])
 
+    def get_contact_proxy_points_world_12(self) -> np.ndarray:
+        points = []
+        for group_name in SEMANTIC_CONTACT_NAMES:
+            geom_ids = self.contact_group_geom_ids_12.get(group_name, [])
+            if geom_ids:
+                geom_points = [self.data.geom_xpos[int(geom_id)].copy() for geom_id in geom_ids]
+                points.append(np.mean(np.asarray(geom_points, dtype=np.float64), axis=0))
+            else:
+                fallback_body_ids = list(self.contact_group_body_ids_12.get(group_name, []))
+                if fallback_body_ids:
+                    points.append(self.data.xpos[int(fallback_body_ids[0])].copy())
+                else:
+                    points.append(np.zeros(3, dtype=np.float64))
+        return np.asarray(points, dtype=np.float64)
+
+    def get_contact_candidate_points_world(self) -> tuple[np.ndarray, np.ndarray]:
+        points = [
+            self.data.geom_xpos[int(geom_id)].copy()
+            for geom_id in self.contact_candidate_geom_ids
+        ]
+        return (
+            np.asarray(points, dtype=np.float64),
+            np.asarray(self.contact_candidate_family_indices, dtype=np.int64),
+        )
+
+    def get_finger_directions_world(self) -> np.ndarray:
+        contact_points = self.get_contact_proxy_points_world_12()
+        semantic_sites = self.get_semantic_sites_world()
+        finger_dirs = [
+            semantic_sites[2] - contact_points[1],   # thumb
+            semantic_sites[3] - contact_points[4],   # index
+            semantic_sites[4] - contact_points[6],   # middle
+            semantic_sites[5] - contact_points[8],   # ring
+            semantic_sites[6] - contact_points[10],  # little
+        ]
+        norms = np.linalg.norm(finger_dirs, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        return np.asarray(finger_dirs, dtype=np.float64) / norms
+
+    def get_table_top_z(self) -> float:
+        return float(self.model.geom_pos[self.table_geom_id, 2] + self.model.geom_size[self.table_geom_id, 2])
+
+    def get_proxy_table_clearance_12(self) -> np.ndarray:
+        top_z = self.get_table_top_z()
+        points = self.get_contact_proxy_points_world_12()
+        return np.asarray(points[:, 2] - top_z, dtype=np.float64)
+
+    def get_arm_link_positions_world(self, link_names: list[str] | None = None) -> np.ndarray:
+        names = self.arm_link_names if link_names is None else link_names
+        return np.vstack([self.data.xpos[self.body_id_by_name[name]].copy() for name in names])
+
+    def get_arm_table_clearance(self, link_names: list[str] | None = None) -> np.ndarray:
+        positions = self.get_arm_link_positions_world(link_names)
+        return np.asarray(positions[:, 2] - self.get_table_top_z(), dtype=np.float64)
+
+    def get_arm_sweep_proxy_points_world(self) -> np.ndarray:
+        points: list[np.ndarray] = []
+        for start_name, end_name in self.arm_sweep_link_pairs:
+            start = self.data.xpos[self.body_id_by_name[start_name]].copy()
+            end = self.data.xpos[self.body_id_by_name[end_name]].copy()
+            for alpha in (0.0, 0.33, 0.66, 1.0):
+                points.append((1.0 - alpha) * start + alpha * end)
+        return np.asarray(points, dtype=np.float64)
+
+    def get_arm_sweep_table_clearance(self) -> np.ndarray:
+        points = self.get_arm_sweep_proxy_points_world()
+        return np.asarray(points[:, 2] - self.get_table_top_z(), dtype=np.float64)
+
     def get_site_velocity(self, site_name: str) -> tuple[np.ndarray, np.ndarray]:
         site_id = self.site_id_by_name[site_name]
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
@@ -259,10 +374,17 @@ class RobotSceneModel:
         self.model.geom_pos[self.table_geom_id, 2] = center_z
         mujoco.mj_forward(self.model, self.data)
 
-    def step(self, ctrl: np.ndarray, frame_skip: int) -> None:
+    def step(self, ctrl: np.ndarray, frame_skip: int, arm_support_force_world: np.ndarray | None = None) -> None:
         self.data.ctrl[:] = self.clamp_actuated(np.asarray(ctrl, dtype=np.float64))
+        support_torque = None
+        if arm_support_force_world is not None:
+            support_torque = self._arm_support_torque(np.asarray(arm_support_force_world, dtype=np.float64))
         for _ in range(frame_skip):
+            self.data.qfrc_applied[:] = 0.0
+            if support_torque is not None:
+                self.data.qfrc_applied[:] = support_torque
             mujoco.mj_step(self.model, self.data)
+        self.data.qfrc_applied[:] = 0.0
 
     def settle_actuated_pose(self, actuated_qpos: np.ndarray, settle_steps: int) -> None:
         actuated_qpos = self.clamp_actuated(np.asarray(actuated_qpos, dtype=np.float64))
