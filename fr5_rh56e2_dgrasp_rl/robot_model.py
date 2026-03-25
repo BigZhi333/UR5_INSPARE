@@ -10,7 +10,7 @@ import numpy as np
 from .scene_builder import build_training_scene
 from .semantics import (
     GENHAND_CONTACT_FAMILY_NAMES,
-    GENHAND_ROBOT_CONTACT_CANDIDATES,
+    GENHAND_ROBOT_CONTACT_PADSET_FILE,
     SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M,
     SEMANTIC_CONTACT_NAMES,
 )
@@ -136,18 +136,34 @@ class RobotSceneModel:
             for group, body_ids in self.contact_group_body_ids_12.items()
         }
         self.contact_candidate_names: list[str] = []
-        self.contact_candidate_geom_ids: list[int] = []
         self.contact_candidate_family_indices: list[int] = []
+        self.contact_candidate_patch_channels: list[list[dict[str, np.ndarray | int | str]]] = []
         family_index_by_name = {
             family_name: family_index for family_index, family_name in enumerate(GENHAND_CONTACT_FAMILY_NAMES)
         }
-        for geom_name, family_name in GENHAND_ROBOT_CONTACT_CANDIDATES:
-            geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
-            if geom_id == -1:
+        for family_name, patch_specs in self._load_contact_padset().items():
+            patches: list[dict[str, np.ndarray | int | str]] = []
+            for patch_spec in patch_specs:
+                body_name = str(patch_spec["body_name"])
+                body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                if body_id == -1:
+                    continue
+                local_points = np.asarray(patch_spec["contact_points"], dtype=np.float64).reshape(-1, 3)
+                local_normals = np.asarray(patch_spec["contact_normals"], dtype=np.float64).reshape(-1, 3)
+                patches.append(
+                    {
+                        "body_id": int(body_id),
+                        "body_name": body_name,
+                        "sensor_mesh": str(patch_spec["sensor_mesh"]),
+                        "local_points": local_points,
+                        "local_normals": local_normals,
+                    }
+                )
+            if not patches:
                 continue
-            self.contact_candidate_names.append(geom_name)
-            self.contact_candidate_geom_ids.append(int(geom_id))
-            self.contact_candidate_family_indices.append(int(family_index_by_name[family_name]))
+            self.contact_candidate_names.append(family_name)
+            self.contact_candidate_family_indices.append(int(family_index_by_name[str(family_name)]))
+            self.contact_candidate_patch_channels.append(patches)
 
         self.actuated_lower = np.array([self.joint_limits[name][0] for name in self.actuated_joints], dtype=np.float64)
         self.actuated_upper = np.array([self.joint_limits[name][1] for name in self.actuated_joints], dtype=np.float64)
@@ -308,25 +324,77 @@ class RobotSceneModel:
                     points.append(np.zeros(3, dtype=np.float64))
         return np.asarray(points, dtype=np.float64)
 
-    def get_contact_candidate_points_world(self) -> tuple[np.ndarray, np.ndarray]:
-        points = [
-            self.data.geom_xpos[int(geom_id)].copy()
-            for geom_id in self.contact_candidate_geom_ids
-        ]
+    def _load_contact_padset(self) -> dict[str, list[dict[str, object]]]:
+        padset_path = Path(__file__).resolve().parent.parent / "assets" / "base_scene" / GENHAND_ROBOT_CONTACT_PADSET_FILE
+        payload = json.loads(padset_path.read_text(encoding="utf-8"))
+        grouped: dict[str, list[dict[str, object]]] = {family: [] for family in GENHAND_CONTACT_FAMILY_NAMES}
+        for item in payload:
+            family_name = str(item["family_name"])
+            if family_name not in grouped:
+                continue
+            grouped[family_name].append(dict(item))
+        return grouped
+
+    def get_contact_candidate_point_sets_world(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        point_sets: list[np.ndarray] = []
+        normal_sets: list[np.ndarray] = []
+        family_indices: list[int] = []
+        for family_index, patch_specs in zip(
+            self.contact_candidate_family_indices,
+            self.contact_candidate_patch_channels,
+        ):
+            family_points: list[np.ndarray] = []
+            family_normals: list[np.ndarray] = []
+            for patch in patch_specs:
+                body_id = int(patch["body_id"])
+                local_points = np.asarray(patch["local_points"], dtype=np.float64)
+                local_normals = np.asarray(patch["local_normals"], dtype=np.float64)
+                rotation = self.data.xmat[body_id].reshape(3, 3).copy()
+                translation = self.data.xpos[body_id].copy()
+                family_points.append((rotation @ local_points.T).T + translation)
+                family_normals.append((rotation @ local_normals.T).T)
+            if not family_points:
+                continue
+            points = np.concatenate(family_points, axis=0)
+            normals = np.concatenate(family_normals, axis=0)
+            point_sets.append(points)
+            normal_sets.append(normals)
+            family_indices.append(int(family_index))
+        if not point_sets:
+            return (
+                np.zeros((0, 0, 3), dtype=np.float64),
+                np.zeros((0, 0, 3), dtype=np.float64),
+                np.zeros(0, dtype=np.int64),
+            )
         return (
-            np.asarray(points, dtype=np.float64),
-            np.asarray(self.contact_candidate_family_indices, dtype=np.int64),
+            np.asarray(point_sets, dtype=np.float64),
+            np.asarray(normal_sets, dtype=np.float64),
+            np.asarray(family_indices, dtype=np.int64),
+        )
+
+    def get_contact_candidate_points_world(self) -> tuple[np.ndarray, np.ndarray]:
+        point_sets, _normal_sets, family_indices = self.get_contact_candidate_point_sets_world()
+        if point_sets.size == 0:
+            return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.int64)
+        flat_points = point_sets.reshape(-1, 3)
+        repeated_families = np.repeat(family_indices, point_sets.shape[1])
+        return (
+            np.asarray(flat_points, dtype=np.float64),
+            np.asarray(repeated_families, dtype=np.int64),
         )
 
     def get_finger_directions_world(self) -> np.ndarray:
-        contact_points = self.get_contact_proxy_points_world_12()
+        point_sets, _normal_sets, family_indices = self.get_contact_candidate_point_sets_world()
         semantic_sites = self.get_semantic_sites_world()
+        channel_centers = np.zeros((len(GENHAND_CONTACT_FAMILY_NAMES), 3), dtype=np.float64)
+        for point_set, family_index in zip(point_sets, family_indices):
+            channel_centers[int(family_index)] = np.mean(np.asarray(point_set, dtype=np.float64), axis=0)
         finger_dirs = [
-            semantic_sites[2] - contact_points[1],   # thumb
-            semantic_sites[3] - contact_points[4],   # index
-            semantic_sites[4] - contact_points[6],   # middle
-            semantic_sites[5] - contact_points[8],   # ring
-            semantic_sites[6] - contact_points[10],  # little
+            semantic_sites[2] - channel_centers[0],  # thumb
+            semantic_sites[3] - channel_centers[1],  # index
+            semantic_sites[4] - channel_centers[2],  # middle
+            semantic_sites[5] - channel_centers[3],  # ring
+            semantic_sites[6] - channel_centers[4],  # little
         ]
         norms = np.linalg.norm(finger_dirs, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-8)

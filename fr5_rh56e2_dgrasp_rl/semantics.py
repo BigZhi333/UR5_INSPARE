@@ -29,7 +29,6 @@ SEMANTIC_CONTACT_NAMES = (
     "little_distal",
 )
 GENHAND_CONTACT_FAMILY_NAMES = (
-    "palm",
     "thumb",
     "index",
     "middle",
@@ -37,20 +36,16 @@ GENHAND_CONTACT_FAMILY_NAMES = (
     "little",
 )
 GENHAND_ROBOT_CONTACT_CANDIDATES = (
-    ("proxy_palm_main", "palm"),
-    ("proxy_palm_upper", "palm"),
-    ("proxy_thumb_proximal", "thumb"),
-    ("proxy_thumb_middle", "thumb"),
     ("proxy_thumb_distal", "thumb"),
-    ("proxy_index_proximal", "index"),
     ("proxy_index_distal", "index"),
-    ("proxy_middle_proximal", "middle"),
     ("proxy_middle_distal", "middle"),
-    ("proxy_ring_proximal", "ring"),
     ("proxy_ring_distal", "ring"),
-    ("proxy_little_proximal", "little"),
     ("proxy_little_distal", "little"),
 )
+# GenHand-style fixed local contact pads for RH56E2. These pads intentionally
+# exclude the tiny "指端" tactile arrays and keep only the larger fingertip /
+# finger-pulp sensing regions that participate in grasp support.
+GENHAND_ROBOT_CONTACT_PADSET_FILE = "contact_rh56e2.json"
 SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M = (
     0.0055,  # palm
     0.0050,  # thumb proximal

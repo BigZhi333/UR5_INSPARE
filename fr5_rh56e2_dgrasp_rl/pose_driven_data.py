@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
+from itertools import product
 from pathlib import Path
 from typing import Any
 
 import joblib
+import hdbscan
 import numpy as np
-from scipy.cluster.vq import kmeans2
+import torch
 from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.spatial.transform import Rotation
 
 from .kinematics import solve_arm_wrist_palm_ik
-from .paths import BUNDLED_DGRASP_DIR, WORKSPACE_DIR, ensure_runtime_dirs
+from .paths import BUNDLED_DGRASP_DIR, PROJECT_DIR, WORKSPACE_DIR, ensure_runtime_dirs
 from .robot_model import RobotSceneModel
 from .scene_builder import build_training_scene
 from .semantics import (
@@ -48,6 +52,7 @@ PROJECTION_HARD_TOTAL_PENETRATION_M = 0.0100
 PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M = 0.050
 PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG = 18.0
 PROJECTION_HOLD_TEST_STEPS = 36
+PROJECTION_HOLD_PRELOAD_STEPS = 10
 PROJECTION_HOLD_ARM_KP_SCALE = 2.5
 PROJECTION_HOLD_SUPPORT_FORCE_SCALE = 10.0
 PROJECTION_HOLD_MAX_DROP_M = 0.028
@@ -58,14 +63,6 @@ PROJECTION_CYLINDER_PALM_CLEARANCE_TOL_M = 0.010
 PROJECTION_CYLINDER_HOLD_PALM_CLEARANCE_TOL_M = 0.015
 PROJECTION_CYLINDER_OPPOSITION_TARGET_COS = -0.20
 PROJECTION_CYLINDER_HOLD_OPPOSITION_TARGET_COS = -0.10
-CONTACT_DRIVEN_MAX_NFEV = 42
-CONTACT_DRIVEN_POSITION_WEIGHT = 4.0
-CONTACT_DRIVEN_DIRECTION_WEIGHT = 1.5
-CONTACT_DRIVEN_PALM_WEIGHT = 2.0
-CONTACT_DRIVEN_PENETRATION_WEIGHT = 18.0
-CONTACT_DRIVEN_TABLE_WEIGHT = 12.0
-CONTACT_DRIVEN_WRIST_REG_WEIGHT = 0.35
-CONTACT_DRIVEN_HAND_REG_WEIGHT = 0.10
 GENHAND_ANCHOR_POSITION_WEIGHT = 6.5
 GENHAND_ACTIVE_DISTANCE_WEIGHT = 9.0
 GENHAND_DIRECTION_WEIGHT = 2.2
@@ -81,6 +78,26 @@ GENHAND_ARM_TABLE_WEIGHT = 8.0
 GENHAND_WRIST_REG_WEIGHT = 0.30
 GENHAND_HAND_REG_WEIGHT = 0.10
 GENHAND_MAX_NFEV = 56
+GENHAND_CONTACT_SURFACE_MAX_DIST_M = 0.030
+GENHAND_ANTIPODAL_MIN_COS = 0.18
+GENHAND_PACKED_MAX_PER_FINGER = 16
+GENHAND_PACKED_FALLBACK_PER_FINGER = 8
+GENHAND_FRICTION_COEFF = 0.7
+GENHAND_FORCE_CLOSURE_SIGMA_WEIGHT = 0.10
+GENHAND_FORCE_CLOSURE_SPREAD_WEIGHT = 0.05
+GENHAND_HDBSCAN_NORMAL_MIN_CLUSTER = 10
+GENHAND_HDBSCAN_POSITION_MIN_CLUSTER = 4
+GENHAND_FC_MAX_ITERS = 120
+GENHAND_GF_MAX_ITERS = 60
+GENHAND_FC_LR = 1.0e-3
+GENHAND_GF_LR = 5.0e-3
+GENHAND_CONTACT_TARGET_TOL_M = 0.010
+GENHAND_HAND_SEED_RELAXED_COEFF = np.array([0.18, 0.22, 0.18, 0.18, 0.18, 0.16], dtype=np.float64)
+GENHAND_HAND_SEED_BALANCED_COEFF = np.array([0.34, 0.42, 0.30, 0.30, 0.30, 0.26], dtype=np.float64)
+GENHAND_HAND_SEED_AGGRESSIVE_COEFF = np.array([0.48, 0.60, 0.42, 0.42, 0.42, 0.36], dtype=np.float64)
+GENHAND_HAND_SEED_THUMB_LEAD_COEFF = np.array([0.42, 0.56, 0.24, 0.24, 0.24, 0.20], dtype=np.float64)
+GENHAND_ROOT_DIR = WORKSPACE_DIR / "Generalised_Human_Grasp_Kinematic_Retargeting"
+GENHAND_MANOPTH_DIR = GENHAND_ROOT_DIR / "network" / "manopth"
 REACHABILITY_TARGET_WRIST_XY_M = np.array([0.66, -0.52], dtype=np.float64)
 REACHABILITY_MAX_SHIFT_XY_M = np.array([0.10, 0.14], dtype=np.float64)
 REACHABILITY_TABLE_MARGIN_XY_M = np.array([0.06, 0.08], dtype=np.float64)
@@ -88,24 +105,13 @@ REACHABILITY_MIN_OBJECT_FACING_COS = 0.45
 REACHABILITY_MAX_BASE_FACING_COS = 0.20
 REACHABILITY_MIN_DOWNWARD_APPROACH = 0.15
 REACHABILITY_MIN_ARM_TABLE_CLEARANCE_M = 0.045
-CONTACT_FAMILY_GROUPS_12: tuple[tuple[int, ...], ...] = (
-    (0,),
-    (1, 2, 3),
-    (4, 5),
-    (6, 7),
-    (8, 9),
-    (10, 11),
-)
-GENHAND_ROBOT_FAMILY_CAPACITY = {
-    family_name: sum(1 for _, family in GENHAND_ROBOT_CONTACT_CANDIDATES if family == family_name)
-    for family_name in GENHAND_CONTACT_FAMILY_NAMES
-}
-CONTACT_FAMILY_TO_FINGER_INDEX = {
-    1: 0,
-    2: 1,
-    3: 2,
-    4: 3,
-    5: 4,
+DGRASP_MANO_TRANSLATION_OFFSET = np.array([0.09566993, 0.00638343, 0.00618631], dtype=np.float64)
+GENHAND_MANO_CONTACT_ZONES = {
+    "index": [350, 355, 329, 332, 349, 354, 343, 327, 351, 353, 348, 328, 347, 326, 337, 346],
+    "middle": [462, 439, 467, 442, 461, 466, 455, 437, 459, 438, 465, 460, 436, 463, 449, 434],
+    "ring": [573, 550, 578, 577, 553, 572, 566, 570, 576, 549, 548, 547, 574, 571, 546, 569],
+    "little": [690, 689, 667, 695, 670, 694, 664, 683, 688, 665, 693, 691, 666, 687, 661, 663],
+    "thumb": [743, 738, 768, 740, 763, 737, 766, 767, 764, 734, 735, 762, 745, 761, 717, 765],
 }
 @dataclass
 class PoseDrivenSample:
@@ -126,7 +132,7 @@ class PoseDrivenSample:
     contact_distance_12_m: list[float]
     contact_mask_12: list[float]
     valid_execution: bool
-    fit_error: dict[str, float]
+    fit_error: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -202,7 +208,7 @@ class PoseDrivenSample:
             contact_distance_12_m=[float(v) for v in contact_distance_12_m],
             contact_mask_12=[float(v) for v in contact_mask_12],
             valid_execution=bool(payload["valid_execution"]),
-            fit_error={str(k): float(v) for k, v in payload["fit_error"].items()},
+            fit_error={str(k): _coerce_fit_error_value(v) for k, v in payload["fit_error"].items()},
         )
 
     def semantic_sites_world(self) -> np.ndarray:
@@ -229,6 +235,17 @@ def save_pose_driven_samples(path: Path, samples: list[PoseDrivenSample]) -> Non
 def load_pose_driven_samples(path: Path) -> list[PoseDrivenSample]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return [PoseDrivenSample.from_dict(item) for item in payload]
+
+
+def _coerce_fit_error_value(value: Any) -> Any:
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
 
 
 def _xyzw_pose_to_wxyz(pose: np.ndarray) -> np.ndarray:
@@ -396,12 +413,14 @@ def _run_projection_hold_test(
     start_object_pose = runtime.get_object_pose()
     start_frame = quat_wxyz_to_matrix(start_object_pose[3:])
 
-    runtime.set_table_height(0.0)
     runtime.set_arm_hold_mode(True, arm_kp_scale=PROJECTION_HOLD_ARM_KP_SCALE)
     support_force_world = np.array(
         [0.0, 0.0, float(config.object_mass_kg) * PROJECTION_HOLD_SUPPORT_FORCE_SCALE],
         dtype=np.float64,
     )
+    for _ in range(PROJECTION_HOLD_PRELOAD_STEPS):
+        runtime.step(ctrl_target, config.frame_skip, arm_support_force_world=support_force_world)
+    runtime.set_table_height(0.0)
     for _ in range(PROJECTION_HOLD_TEST_STEPS):
         runtime.step(ctrl_target, config.frame_skip, arm_support_force_world=support_force_world)
 
@@ -432,23 +451,35 @@ def _pose_delta_local(source_pose: np.ndarray, target_pose: np.ndarray) -> tuple
     return translation_local, rotvec_local
 
 
-def _cylinder_hand_wrap_seed(runtime: RobotSceneModel, source_contact_mask_12: np.ndarray, strength: float = 1.0) -> np.ndarray:
-    group_presence = _contact_group_presence(source_contact_mask_12)
-    base_coeff = np.array([0.30, 0.40, 0.46, 0.46, 0.44, 0.40], dtype=np.float64)
-    contact_bonus = np.array(
-        [
-            0.12 if group_presence[1] > 0.5 else 0.04,
-            0.18 if group_presence[1] > 0.5 else 0.08,
-            0.16 if group_presence[2] > 0.5 else 0.06,
-            0.16 if group_presence[3] > 0.5 else 0.06,
-            0.14 if group_presence[4] > 0.5 else 0.05,
-            0.14 if group_presence[5] > 0.5 else 0.05,
-        ],
-        dtype=np.float64,
-    )
-    coeff = np.clip(base_coeff + strength * contact_bonus, 0.0, 0.92)
-    wrap_seed = runtime.home_actuated[6:] + coeff * (runtime.hand_upper - runtime.home_actuated[6:])
-    return runtime.clamp_hand(wrap_seed)
+def _genhand_hand_seed_from_coeff(runtime: RobotSceneModel, coeff: np.ndarray) -> np.ndarray:
+    coeff = np.asarray(coeff, dtype=np.float64).reshape(runtime.hand_upper.shape)
+    coeff = np.clip(coeff, 0.0, 1.0)
+    seed = runtime.hand_lower + coeff * (runtime.hand_upper - runtime.hand_lower)
+    return runtime.clamp_hand(seed)
+
+
+def _genhand_hand_seed_variants(runtime: RobotSceneModel, base_hand_qpos: np.ndarray) -> dict[str, np.ndarray]:
+    base = runtime.clamp_hand(np.asarray(base_hand_qpos, dtype=np.float64))
+    relaxed = np.maximum(base, _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_RELAXED_COEFF))
+    balanced = np.maximum(base, _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_BALANCED_COEFF))
+    aggressive = np.maximum(base, _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_AGGRESSIVE_COEFF))
+    thumb_lead = np.maximum(base, _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_THUMB_LEAD_COEFF))
+    return {
+        "relaxed": runtime.clamp_hand(relaxed),
+        "balanced": runtime.clamp_hand(balanced),
+        "aggressive": runtime.clamp_hand(aggressive),
+        "thumb_lead": runtime.clamp_hand(thumb_lead),
+    }
+
+
+def _cylinder_hand_wrap_seed(runtime: RobotSceneModel, strength: float = 1.0) -> np.ndarray:
+    relaxed = _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_RELAXED_COEFF)
+    balanced = _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_BALANCED_COEFF)
+    aggressive = _genhand_hand_seed_from_coeff(runtime, GENHAND_HAND_SEED_AGGRESSIVE_COEFF)
+    blend = float(np.clip(strength - 1.0, 0.0, 0.5) / 0.5)
+    base = (1.0 - blend) * balanced + blend * aggressive
+    base = 0.15 * relaxed + 0.85 * base
+    return runtime.clamp_hand(base)
 
 
 def _cylinder_grasp_seed_states(
@@ -457,7 +488,6 @@ def _cylinder_grasp_seed_states(
     object_pose_goal: np.ndarray,
     source_wrist_pose_world: np.ndarray,
     source_semantic_sites_world: np.ndarray,
-    source_contact_mask_12: np.ndarray,
     base_hand_qpos: np.ndarray,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     if config.object_geom_type != "cylinder":
@@ -507,7 +537,7 @@ def _cylinder_grasp_seed_states(
             + tangent * tangent_offset
         )
         approach = -radial
-        wrap_seed = _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=squeeze_strength)
+        wrap_seed = _cylinder_hand_wrap_seed(runtime, strength=squeeze_strength)
         blended_hand = runtime.clamp_hand(0.20 * np.asarray(base_hand_qpos, dtype=np.float64) + 0.80 * wrap_seed)
         for across_hint in across_candidates:
             across = across_hint - approach * float(np.dot(across_hint, approach))
@@ -532,7 +562,6 @@ def _cylinder_object_frame_seed_poses(
     config: TaskConfig,
     object_pose_goal: np.ndarray,
     source_keypoints_obj: np.ndarray,
-    source_contact_mask_12: np.ndarray,
     base_hand_qpos: np.ndarray,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     if config.object_geom_type != "cylinder":
@@ -550,12 +579,8 @@ def _cylinder_object_frame_seed_poses(
     palm_obj = np.asarray(contact_targets_obj[0], dtype=np.float64)
     thumb_targets = np.asarray(contact_targets_obj[1:4], dtype=np.float64)
     finger_targets = np.asarray(contact_targets_obj[4:], dtype=np.float64)
-    source_contact_mask_12 = np.asarray(source_contact_mask_12, dtype=np.float64)
-
-    active_thumb = thumb_targets[source_contact_mask_12[1:4] > 0.5]
-    active_fingers = finger_targets[source_contact_mask_12[4:] > 0.5]
-    thumb_center_obj = np.mean(active_thumb, axis=0) if active_thumb.size else np.mean(thumb_targets, axis=0)
-    finger_center_obj = np.mean(active_fingers, axis=0) if active_fingers.size else np.mean(finger_targets, axis=0)
+    thumb_center_obj = np.mean(thumb_targets, axis=0)
+    finger_center_obj = np.mean(finger_targets, axis=0)
 
     palm_radial_obj = palm_obj - cylinder_axis_obj * float(np.dot(palm_obj, cylinder_axis_obj))
     if np.linalg.norm(palm_radial_obj) < 1e-8:
@@ -578,8 +603,9 @@ def _cylinder_object_frame_seed_poses(
     height_offsets = [0.0]
     roll_offsets_deg = [-12.0, 0.0, 12.0]
 
-    base_wrap = _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=1.15)
-    stronger_wrap = _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=1.35)
+    seed_variants = _genhand_hand_seed_variants(runtime, base_hand_qpos)
+    base_wrap = 0.30 * seed_variants["relaxed"] + 0.70 * seed_variants["balanced"]
+    stronger_wrap = 0.20 * seed_variants["balanced"] + 0.80 * seed_variants["aggressive"]
 
     seeds: list[tuple[np.ndarray, np.ndarray]] = []
     for clearance in clearance_values:
@@ -692,129 +718,173 @@ def _human_contact_target_points_obj(source_keypoints_obj: np.ndarray) -> np.nda
     return targets
 
 
-def _source_contact_family_mask(source_contact_mask_12: np.ndarray) -> np.ndarray:
-    mask_12 = np.asarray(source_contact_mask_12, dtype=np.float64).reshape(12)
-    family_mask = np.zeros(len(GENHAND_CONTACT_FAMILY_NAMES), dtype=np.float64)
-    family_mask[0] = float(mask_12[0] > 0.5)
-    family_mask[1] = float(np.max(mask_12[1:4]) > 0.5)
-    family_mask[2] = float(np.max(mask_12[4:6]) > 0.5)
-    family_mask[3] = float(np.max(mask_12[6:8]) > 0.5)
-    family_mask[4] = float(np.max(mask_12[8:10]) > 0.5)
-    family_mask[5] = float(np.max(mask_12[10:12]) > 0.5)
-    return family_mask
+@lru_cache(maxsize=1)
+def _locate_mano_models_dir() -> Path | None:
+    candidates = [
+        GENHAND_MANOPTH_DIR / "mano" / "models",
+        WORKSPACE_DIR,
+        PROJECT_DIR,
+    ]
+    for candidate in candidates:
+        if (candidate / "MANO_RIGHT.pkl").exists() and (candidate / "MANO_LEFT.pkl").exists():
+            return candidate
+        if (candidate / "MANO_RIGHT.pkl").exists():
+            return candidate
+    matches = list(WORKSPACE_DIR.rglob("MANO_RIGHT.pkl"))
+    if matches:
+        return matches[0].parent
+    return None
 
 
-def _human_contact_candidate_points_obj(source_keypoints_obj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    keypoints = np.asarray(source_keypoints_obj, dtype=np.float64).reshape(21, 3)
-    semantic_sites = mano_semantic_sites_from_keypoints(keypoints)
-    points: list[np.ndarray] = []
-    family_indices: list[int] = []
-
-    def add(point: np.ndarray, family_index: int) -> None:
-        points.append(np.asarray(point, dtype=np.float64))
-        family_indices.append(int(family_index))
-
-    def midpoint(a: int, b: int) -> np.ndarray:
-        return 0.5 * (keypoints[a] + keypoints[b])
-
-    # Palm candidates: keep a small set of broad palm anchors rather than a single fixed palm slot.
-    add(semantic_sites[1], 0)
-    add(np.mean(keypoints[[1, 5]], axis=0), 0)
-    add(np.mean(keypoints[[9, 13]], axis=0), 0)
-    add(np.mean(keypoints[[1, 5, 9, 13]], axis=0), 0)
-
-    finger_chains = (
-        (1, (17, 18, 19, 20)),  # thumb
-        (2, (1, 2, 3, 4)),      # index
-        (3, (5, 6, 7, 8)),      # middle
-        (4, (9, 10, 11, 12)),   # ring
-        (5, (13, 14, 15, 16)),  # little
+@lru_cache(maxsize=1)
+def _load_genhand_mano_layer():
+    if not GENHAND_MANOPTH_DIR.exists():
+        return None
+    mano_models_dir = _locate_mano_models_dir()
+    if mano_models_dir is None:
+        return None
+    manopth_path = str(GENHAND_MANOPTH_DIR)
+    if manopth_path not in sys.path:
+        sys.path.insert(0, manopth_path)
+    # Vendored manopth depends on chumpy, which still expects legacy NumPy aliases.
+    if not hasattr(np, "int"):
+        np.int = int  # type: ignore[attr-defined]
+    if not hasattr(np, "float"):
+        np.float = float  # type: ignore[attr-defined]
+    if not hasattr(np, "bool"):
+        np.bool = bool  # type: ignore[attr-defined]
+    if not hasattr(np, "complex"):
+        np.complex = complex  # type: ignore[attr-defined]
+    if not hasattr(np, "object"):
+        np.object = object  # type: ignore[attr-defined]
+    if not hasattr(np, "str"):
+        np.str = str  # type: ignore[attr-defined]
+    if not hasattr(np, "unicode"):
+        np.unicode = str  # type: ignore[attr-defined]
+    try:
+        from manopth.manolayer import ManoLayer  # type: ignore
+    except Exception:
+        return None
+    layer = ManoLayer(
+        mano_root=str(mano_models_dir),
+        use_pca=False,
+        ncomps=45,
+        side="right",
+        flat_hand_mean=True,
     )
-    for family_index, chain in finger_chains:
-        add(midpoint(chain[0], chain[1]), family_index)
-        add(midpoint(chain[1], chain[2]), family_index)
-        add(midpoint(chain[2], chain[3]), family_index)
-        add(keypoints[chain[3]], family_index)
-
-    return np.asarray(points, dtype=np.float64), np.asarray(family_indices, dtype=np.int64)
+    layer.eval()
+    return layer
 
 
-def _cluster_points_to_surface_anchors(
-    points_obj: np.ndarray,
-    normals_obj: np.ndarray,
-    family_indices: np.ndarray,
-    family_mask: np.ndarray,
-    family_capacities: dict[str, int],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    clustered_points: list[np.ndarray] = []
-    clustered_normals: list[np.ndarray] = []
-    clustered_families: list[int] = []
+@lru_cache(maxsize=1)
+def _load_genhand_fc_loss():
+    root_path = str(GENHAND_ROOT_DIR)
+    if root_path not in sys.path:
+        sys.path.insert(0, root_path)
+    try:
+        from optimisation.loss import FCLoss  # type: ignore
+    except Exception:
+        return None
+    try:
+        return FCLoss(device="cpu")
+    except Exception:
+        return None
 
-    points_obj = np.asarray(points_obj, dtype=np.float64)
-    normals_obj = np.asarray(normals_obj, dtype=np.float64)
-    family_indices = np.asarray(family_indices, dtype=np.int64)
-    family_mask = np.asarray(family_mask, dtype=np.float64)
 
-    for family_index, family_name in enumerate(GENHAND_CONTACT_FAMILY_NAMES):
-        if family_mask[family_index] <= 0.5:
-            continue
-        member_indices = np.flatnonzero(family_indices == family_index)
-        if member_indices.size == 0:
-            continue
-        family_points = points_obj[member_indices]
-        family_normals = normals_obj[member_indices]
-        unique_points = np.unique(np.round(family_points, decimals=6), axis=0)
-        target_clusters = max(
-            1,
-            min(
-                int(family_capacities[family_name]),
-                int(member_indices.size),
-                int(unique_points.shape[0]),
-            ),
-        )
+@lru_cache(maxsize=1)
+def _load_genhand_icp_module():
+    root_path = str(GENHAND_ROOT_DIR)
+    if root_path not in sys.path:
+        sys.path.insert(0, root_path)
+    try:
+        from optimisation import icp  # type: ignore
+    except Exception:
+        return None
+    return icp
 
-        if target_clusters == 1:
-            centroid = np.mean(family_points, axis=0)
-            nearest_index = int(np.argmin(np.linalg.norm(family_points - centroid, axis=1)))
-            clustered_points.append(family_points[nearest_index])
-            clustered_normals.append(normalize(np.mean(family_normals, axis=0)))
-            clustered_families.append(family_index)
-            continue
 
-        try:
-            centroids, labels = kmeans2(family_points, target_clusters, minit="points")
-            labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-        except Exception:
-            labels = np.arange(family_points.shape[0], dtype=np.int64) % target_clusters
-            centroids = np.vstack(
-                [
-                    np.mean(family_points[labels == cluster_index], axis=0)
-                    for cluster_index in range(target_clusters)
-                ]
-            )
-        for cluster_index in range(target_clusters):
-            cluster_member_indices = np.flatnonzero(labels == cluster_index)
-            if cluster_member_indices.size == 0:
-                continue
-            cluster_points = family_points[cluster_member_indices]
-            cluster_normals = family_normals[cluster_member_indices]
-            centroid = np.asarray(centroids[cluster_index], dtype=np.float64)
-            nearest_local_index = int(np.argmin(np.linalg.norm(cluster_points - centroid, axis=1)))
-            clustered_points.append(cluster_points[nearest_local_index])
-            clustered_normals.append(normalize(np.mean(cluster_normals, axis=0)))
-            clustered_families.append(family_index)
+def _dgrasp_qpos_world_to_mano_pose_translation(dgrasp_qpos_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    qpos = np.asarray(dgrasp_qpos_world, dtype=np.float64).reshape(51)
+    translation = qpos[:3] - DGRASP_MANO_TRANSLATION_OFFSET
+    global_axisang = Rotation.from_euler("XYZ", qpos[3:6]).as_rotvec()
+    joint_axisang = Rotation.from_euler("XYZ", qpos[6:].reshape(15, 3)).as_rotvec()
+    # In D-Grasp the ring/little finger joint blocks are swapped relative to MANO.
+    temp = joint_axisang[6:9].copy()
+    joint_axisang[6:9] = joint_axisang[9:12]
+    joint_axisang[9:12] = temp
+    pose = np.concatenate([global_axisang, joint_axisang.reshape(-1)])
+    return pose.astype(np.float64), translation.astype(np.float64)
 
-    if not clustered_points:
-        return (
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0, 3), dtype=np.float64),
-            np.zeros((0,), dtype=np.int64),
-        )
-    return (
-        np.asarray(clustered_points, dtype=np.float64),
-        np.asarray(clustered_normals, dtype=np.float64),
-        np.asarray(clustered_families, dtype=np.int64),
-    )
+
+def _mesh_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    normals = np.zeros_like(vertices, dtype=np.float64)
+    if faces.size == 0:
+        return normals
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    for corner in range(3):
+        np.add.at(normals, faces[:, corner], face_normals)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    return normals / norms
+
+
+def _mano_vertices_normals_from_dgrasp_qpos_world(
+    dgrasp_qpos_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    mano_layer = _load_genhand_mano_layer()
+    if mano_layer is None:
+        return None
+    pose, translation = _dgrasp_qpos_world_to_mano_pose_translation(dgrasp_qpos_world)
+    pose_tensor = torch.tensor(pose, dtype=torch.float32).view(1, -1)
+    trans_tensor = torch.tensor(translation, dtype=torch.float32).view(1, 3)
+    with torch.no_grad():
+        verts, joints, *_ = mano_layer(pose_tensor, th_trans=trans_tensor)
+    verts_world = np.asarray(verts[0].detach().cpu().numpy(), dtype=np.float64)
+    joints_world = np.asarray(joints[0].detach().cpu().numpy(), dtype=np.float64)
+    faces = np.asarray(mano_layer.th_faces.detach().cpu().numpy(), dtype=np.int64)
+    normals_world = _mesh_vertex_normals(verts_world, faces)
+    return verts_world, normals_world, joints_world
+
+
+def _contact_tangent_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    normal = normalize(np.asarray(normal, dtype=np.float64))
+    if abs(float(normal[2])) < 0.9:
+        ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    tangent1 = normalize(np.cross(normal, ref))
+    tangent2 = normalize(np.cross(normal, tangent1))
+    return tangent1, tangent2
+
+
+def _force_closure_combo_metrics(points_obj: np.ndarray, normals_obj: np.ndarray) -> tuple[float, float]:
+    points_obj = np.asarray(points_obj, dtype=np.float64).reshape(-1, 3)
+    normals_obj = np.asarray(normals_obj, dtype=np.float64).reshape(-1, 3)
+    if points_obj.shape[0] < 2:
+        return 0.0, 0.0
+    wrench_columns: list[np.ndarray] = []
+    for point, normal in zip(points_obj, normals_obj, strict=True):
+        tangent1, tangent2 = _contact_tangent_basis(normal)
+        for sx, sy in ((1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)):
+            force_dir = normalize(normal + GENHAND_FRICTION_COEFF * (sx * tangent1 + sy * tangent2))
+            torque = np.cross(point, force_dir)
+            wrench_columns.append(np.concatenate([force_dir, torque]))
+    if not wrench_columns:
+        return 0.0, 0.0
+    grasp_matrix = np.column_stack(wrench_columns)
+    singular_values = np.linalg.svd(grasp_matrix, compute_uv=False)
+    sigma_min = float(singular_values[-1]) if singular_values.size >= 6 else 0.0
+    if points_obj.shape[0] == 1:
+        spread = 0.0
+    else:
+        pairwise = np.linalg.norm(points_obj[:, None, :] - points_obj[None, :, :], axis=2)
+        spread = float(np.min(pairwise[np.triu_indices(points_obj.shape[0], k=1)]))
+    return sigma_min, spread
 
 
 def _human_finger_directions_obj(source_keypoints_obj: np.ndarray) -> np.ndarray:
@@ -934,118 +1004,650 @@ def _box_contact_normal_obj(point_obj: np.ndarray, dims_m: np.ndarray) -> np.nda
     return normal
 
 
-def _human_contact_target_normals_obj(config: TaskConfig, source_contact_targets_obj: np.ndarray) -> np.ndarray:
-    targets = np.asarray(source_contact_targets_obj, dtype=np.float64).reshape(12, 3)
-    normals = np.zeros_like(targets)
+def _dense_mano_contact_candidates_obj(
+    config: TaskConfig,
+    source_dgrasp_qpos_world: np.ndarray,
+    object_pose_goal: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    mano_pack = _mano_vertices_normals_from_dgrasp_qpos_world(source_dgrasp_qpos_world)
+    if mano_pack is None:
+        return None
+    verts_world, normals_world, _ = mano_pack
+    inv_pose = inverse_pose7(object_pose_goal)
+    inv_object_rotation = quat_wxyz_to_matrix(np.asarray(inv_pose[3:], dtype=np.float64))
+    verts_obj = transform_points(verts_world, inv_pose)
+    normals_obj = (inv_object_rotation @ normals_world.T).T
+
+    packed_points: list[np.ndarray] = []
+    packed_normals: list[np.ndarray] = []
+    packed_families: list[int] = []
+    for family_index, family_name in enumerate(GENHAND_CONTACT_FAMILY_NAMES):
+        seed_indices = np.asarray(GENHAND_MANO_CONTACT_ZONES[family_name], dtype=np.int64)
+        zone_points = verts_obj[seed_indices]
+        zone_normals = np.asarray([normalize(n) for n in normals_obj[seed_indices]], dtype=np.float64)
+        packed_points.extend(zone_points.tolist())
+        packed_normals.extend(zone_normals.tolist())
+        packed_families.extend([family_index] * len(seed_indices))
+
+    if not packed_points:
+        return None
+    packed_points_arr = np.asarray(packed_points, dtype=np.float64).reshape(-1, 3)
+    packed_normals_arr = np.asarray(packed_normals, dtype=np.float64).reshape(-1, 3)
+    packed_family_arr = np.asarray(packed_families, dtype=np.int64).reshape(-1)
+
+    projected_points, object_normals = _project_targets_to_object_surface(config, packed_points_arr)
+    surface_distance = np.linalg.norm(packed_points_arr - projected_points, axis=1)
+    antipodal_cos = np.sum((-packed_normals_arr) * object_normals, axis=1)
+    candidate_scores = surface_distance + 0.020 * np.maximum(GENHAND_ANTIPODAL_MIN_COS - antipodal_cos, 0.0)
+    valid_mask = (surface_distance <= GENHAND_CONTACT_SURFACE_MAX_DIST_M) & (antipodal_cos >= GENHAND_ANTIPODAL_MIN_COS)
+    if np.any(valid_mask):
+        base_keep_indices = np.flatnonzero(valid_mask)
+        per_family_limit = GENHAND_PACKED_MAX_PER_FINGER
+    else:
+        fallback_count = max(20, min(40, packed_points_arr.shape[0] // 2))
+        base_keep_indices = np.argsort(candidate_scores)[:fallback_count]
+        per_family_limit = GENHAND_PACKED_FALLBACK_PER_FINGER
+
+    balanced_keep: list[int] = []
+    for family_index in range(len(GENHAND_CONTACT_FAMILY_NAMES)):
+        family_indices = base_keep_indices[packed_family_arr[base_keep_indices] == family_index]
+        if family_indices.size == 0:
+            continue
+        family_order = family_indices[np.argsort(candidate_scores[family_indices])]
+        balanced_keep.extend(family_order[:per_family_limit].tolist())
+
+    if balanced_keep:
+        keep_indices = np.asarray(
+            sorted(set(balanced_keep), key=lambda idx: float(candidate_scores[idx])),
+            dtype=np.int64,
+        )
+    else:
+        keep_indices = np.asarray(base_keep_indices, dtype=np.int64)
+
+    return (
+        np.asarray(projected_points[keep_indices], dtype=np.float64),
+        np.asarray(object_normals[keep_indices], dtype=np.float64),
+        np.asarray(packed_family_arr[keep_indices], dtype=np.int64),
+        np.asarray(candidate_scores[keep_indices], dtype=np.float64),
+    )
+
+
+def _object_surface_query_torch(
+    config: TaskConfig,
+    points_obj: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    points = points_obj
+    if points.dim() == 2:
+        points = points.unsqueeze(0)
     if config.object_geom_type == "box":
-        dims = np.asarray(config.object_dims_m, dtype=np.float64)
-        for idx in range(targets.shape[0]):
-            normals[idx] = _box_contact_normal_obj(targets[idx], dims)
-        return normals
+        half = torch.tensor(np.asarray(config.object_dims_m, dtype=np.float32) * 0.5, dtype=torch.float32, device=points.device)
+        abs_points = torch.abs(points)
+        q = abs_points - half.view(1, 1, 3)
+        outside = torch.clamp(q, min=0.0)
+        outside_dist = torch.linalg.norm(outside, dim=-1)
+        inside_dist = torch.clamp(torch.max(q, dim=-1).values, max=0.0)
+        sdf = outside_dist + inside_dist
+        projected = torch.clamp(points, -half.view(1, 1, 3), half.view(1, 1, 3))
+        scaled = projected / torch.clamp(half.view(1, 1, 3), min=1e-8)
+        axis = torch.argmax(torch.abs(scaled), dim=-1)
+        normals = torch.zeros_like(points)
+        axis_sign = torch.where(
+            torch.gather(projected, -1, axis.unsqueeze(-1)).squeeze(-1) >= 0.0,
+            torch.ones_like(axis, dtype=torch.float32, device=points.device),
+            -torch.ones_like(axis, dtype=torch.float32, device=points.device),
+        )
+        normals.scatter_(-1, axis.unsqueeze(-1), axis_sign.unsqueeze(-1))
+        return sdf, normals
     if config.object_geom_type == "cylinder":
-        for idx, point in enumerate(targets):
-            radial = np.asarray([point[0], point[1], 0.0], dtype=np.float64)
-            normals[idx] = normalize(radial)
-        return normals
-    return normals
+        radius = float(config.object_dims_m[0])
+        half_height = 0.5 * float(config.object_dims_m[1])
+        xy = points[..., :2]
+        z = points[..., 2]
+        xy_norm = torch.linalg.norm(xy, dim=-1)
+        side_sdf = xy_norm - radius
+        cap_sdf = torch.abs(z) - half_height
+        outside = torch.stack([torch.clamp(side_sdf, min=0.0), torch.clamp(cap_sdf, min=0.0)], dim=-1)
+        outside_dist = torch.linalg.norm(outside, dim=-1)
+        inside_dist = torch.clamp(torch.maximum(side_sdf, cap_sdf), max=0.0)
+        sdf = outside_dist + inside_dist
+        radial_dir = xy / torch.clamp(xy_norm.unsqueeze(-1), min=1e-8)
+        side_mask = side_sdf >= cap_sdf
+        normals = torch.zeros_like(points)
+        normals[..., :2] = radial_dir
+        cap_sign = torch.where(z >= 0.0, 1.0, -1.0)
+        cap_normals = torch.zeros_like(points)
+        cap_normals[..., 2] = cap_sign
+        normals = torch.where(side_mask.unsqueeze(-1), normals, cap_normals)
+        return sdf, normals
+    sdf = torch.zeros(points.shape[:-1], dtype=torch.float32, device=points.device)
+    normals = torch.nn.functional.normalize(points, dim=-1, eps=1e-8)
+    return sdf, normals
+
+
+def _minimum_internal_distance_torch(points_obj: torch.Tensor) -> torch.Tensor:
+    points = points_obj.view(-1, 3)
+    if points.size(0) <= 1:
+        return torch.zeros((), dtype=torch.float32, device=points.device)
+    dist_matrix = torch.cdist(points, points, p=2)
+    eye = torch.eye(points.size(0), device=points.device) * 1e6
+    min_dists = torch.min(dist_matrix + eye, dim=1).values
+    return torch.relu(torch.tensor(0.01, dtype=torch.float32, device=points.device) - min_dists).sum()
+
+
+def _select_contact_targets_by_count_np(
+    contact_points: np.ndarray,
+    contact_normals: np.ndarray,
+    target_count: int,
+) -> np.ndarray:
+    contact_points = np.asarray(contact_points, dtype=np.float64).reshape(-1, 3)
+    contact_normals = np.asarray(contact_normals, dtype=np.float64).reshape(-1, 3)
+    if contact_points.shape[0] == 0:
+        return contact_points
+    if target_count <= 1 or contact_points.shape[0] == 1:
+        return contact_points[:1]
+    if target_count >= contact_points.shape[0]:
+        return contact_points.copy()
+    if target_count == 2:
+        normal_dot = contact_normals @ contact_normals.T
+        normal_dot = normal_dot + np.eye(normal_dot.shape[0], dtype=np.float64) * 10.0
+        i, j = np.unravel_index(np.argmin(normal_dot), normal_dot.shape)
+        return np.vstack([contact_points[i], contact_points[j]])
+
+    selected = [0]
+    remaining = list(range(1, contact_points.shape[0]))
+    while len(selected) < target_count and remaining:
+        sel_pts = contact_points[selected]
+        rem_pts = contact_points[remaining]
+        dmat = np.linalg.norm(rem_pts[:, None, :] - sel_pts[None, :, :], axis=2)
+        score = np.min(dmat, axis=1)
+        best_idx = remaining[int(np.argmax(score))]
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+    return contact_points[selected]
+
+
+def _cluster_genhand_contact_targets_obj(
+    candidate_points_obj: np.ndarray,
+    candidate_normals_obj: np.ndarray,
+    robot_contact_count: int,
+) -> np.ndarray:
+    contact_points = np.asarray(candidate_points_obj, dtype=np.float64).reshape(-1, 3)
+    contact_normals = np.asarray(candidate_normals_obj, dtype=np.float64).reshape(-1, 3)
+    if contact_points.shape[0] == 0:
+        return contact_points
+    if contact_points.shape[0] < max(GENHAND_HDBSCAN_NORMAL_MIN_CLUSTER, GENHAND_HDBSCAN_POSITION_MIN_CLUSTER):
+        return _select_contact_targets_by_count_np(contact_points, contact_normals, robot_contact_count)
+    try:
+        clusterer_n = hdbscan.HDBSCAN(min_cluster_size=GENHAND_HDBSCAN_NORMAL_MIN_CLUSTER)
+        clusterer_p = hdbscan.HDBSCAN(min_cluster_size=GENHAND_HDBSCAN_POSITION_MIN_CLUSTER)
+        labels_n = np.asarray(clusterer_n.fit_predict(contact_normals), dtype=np.int64)
+        labels_p = np.asarray(clusterer_p.fit_predict(contact_points), dtype=np.int64)
+    except Exception:
+        return _select_contact_targets_by_count_np(contact_points, contact_normals, robot_contact_count)
+
+    valid_mask = (labels_n != -1) & (labels_p != -1)
+    if not np.any(valid_mask):
+        return _select_contact_targets_by_count_np(contact_points, contact_normals, robot_contact_count)
+    contact_points = contact_points[valid_mask]
+    contact_normals = contact_normals[valid_mask]
+    labels_n = labels_n[valid_mask]
+    labels_p = labels_p[valid_mask]
+
+    uniq_labels_n = np.unique(labels_n)
+    uniq_labels_p = np.unique(labels_p)
+    n_normal_components = int(uniq_labels_n.size)
+    n_hand_contacts = int(uniq_labels_p.size)
+    if n_normal_components == 0 or n_hand_contacts == 0:
+        return _select_contact_targets_by_count_np(contact_points, contact_normals, robot_contact_count)
+
+    centroid_n = {}
+    centroid_p = {}
+    p_collection = {}
+    for label in uniq_labels_n:
+        indices = np.where(labels_n == label)[0]
+        p_in_n = labels_p[indices]
+        valid_labels, counts = np.unique(p_in_n, return_counts=True)
+        if valid_labels.size > 1:
+            keep_labels = valid_labels[counts >= 2]
+            if keep_labels.size > 0:
+                keep_mask = np.isin(p_in_n, keep_labels)
+                indices = indices[keep_mask]
+                p_in_n = p_in_n[keep_mask]
+        centroid_n[label] = np.mean(contact_normals[indices], axis=0)
+        p_centroids = []
+        p_collect: list[np.ndarray] = []
+        for p_label in np.unique(p_in_n):
+            indices_p = np.where(p_in_n == p_label)[0]
+            p_centroids.append(np.mean(contact_points[indices[indices_p]], axis=0))
+            p_collect.append(contact_points[indices[indices_p]])
+        centroid_p[label] = np.asarray(p_centroids, dtype=np.float64)
+        p_collection[label] = p_collect
+
+    centroid_n_arr = np.asarray([centroid_n[label] for label in uniq_labels_n], dtype=np.float64)
+    centroid_p_arr = np.vstack([centroid_p[label] for label in uniq_labels_n])
+    centroid_p_n = np.vstack([centroid_p[label].mean(axis=0) for label in uniq_labels_n])
+
+    if n_normal_components > 2:
+        dist_matrix = np.linalg.norm(centroid_n_arr[:, None, :] - centroid_n_arr[None, :, :], axis=2)
+        i, j = np.unravel_index(np.argmax(dist_matrix), dist_matrix.shape)
+        smaller = i if centroid_p[uniq_labels_n[i]].shape[0] <= centroid_p[uniq_labels_n[j]].shape[0] else j
+        larger = j if smaller == i else i
+        contact_0 = centroid_p[uniq_labels_n[smaller]].mean(axis=0)
+        contact_1 = centroid_p[uniq_labels_n[larger]].mean(axis=0)
+        pca_base = np.vstack([cluster_points for label in uniq_labels_n for cluster_points in p_collection[label]])
+        remaining_labels = [label for k, label in enumerate(uniq_labels_n) if k not in (i, j)]
+    else:
+        pair = [0, min(1, len(uniq_labels_n) - 1)]
+        contact_0 = centroid_p[uniq_labels_n[pair[0]]].mean(axis=0)
+        contact_1 = centroid_p[uniq_labels_n[pair[1]]].mean(axis=0)
+        pca_base = np.vstack([cluster_points for label in uniq_labels_n for cluster_points in p_collection[label]])
+        remaining_labels = [label for k, label in enumerate(uniq_labels_n) if k not in pair]
+
+    if robot_contact_count == 2:
+        return np.vstack([contact_0, contact_1])
+    if robot_contact_count > 2 and robot_contact_count <= n_normal_components:
+        targets = [contact_0, contact_1]
+        for label in remaining_labels[: robot_contact_count - 2]:
+            label_idx = int(np.where(uniq_labels_n == label)[0][0])
+            targets.append(centroid_p_n[label_idx])
+        return np.asarray(targets, dtype=np.float64)
+    if robot_contact_count > 2 and robot_contact_count >= n_hand_contacts:
+        return centroid_p_arr[:robot_contact_count].copy()
+
+    return _select_contact_targets_by_count_np(contact_points, contact_normals, robot_contact_count)
+
+
+def _optimize_force_closure_targets_obj(
+    config: TaskConfig,
+    initial_targets_obj: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    initial_targets = np.asarray(initial_targets_obj, dtype=np.float64).reshape(-1, 3)
+    if initial_targets.shape[0] <= 1:
+        projected_points, projected_normals = _project_targets_to_object_surface(config, initial_targets)
+        return projected_points, projected_normals, {
+            "fc_loss": 0.0,
+            "fc_net_wrench": 0.0,
+            "fc_lin_ind": 0.0,
+            "fc_intfc": 0.0,
+            "fc_distance": 0.0,
+            "fc_inter_dist": 0.0,
+        }
+
+    fc_loss = _load_genhand_fc_loss()
+    if fc_loss is None:
+        projected_points, projected_normals = _project_targets_to_object_surface(config, initial_targets)
+        sigma_min, spread = _force_closure_combo_metrics(projected_points, projected_normals)
+        return projected_points, projected_normals, {
+            "fc_loss": 0.0,
+            "fc_net_wrench": 0.0,
+            "fc_lin_ind": float(max(0.0, 1.0 - sigma_min)),
+            "fc_intfc": float(max(0.0, 0.01 - spread)),
+            "fc_distance": 0.0,
+            "fc_inter_dist": 0.0,
+        }
+
+    x = torch.tensor(initial_targets, dtype=torch.float32).unsqueeze(0).requires_grad_(True)
+    w = (torch.ones((1, initial_targets.shape[0], 4), dtype=torch.float32) * 0.25).requires_grad_(True)
+    contact_target = torch.tensor(initial_targets, dtype=torch.float32)
+    relu = torch.nn.ReLU()
+
+    def fc_terms(x_tensor: torch.Tensor, w_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        sdf_val, surface_normals = _object_surface_query_torch(config, x_tensor)
+        x_norm = x_tensor / torch.clamp(torch.linalg.norm(x_tensor, dim=-1).amax(), min=1e-8)
+        G = fc_loss.x_to_G(x_norm)
+        lin_ind = fc_loss.lin_ind(G)
+        f, _edge_forces = fc_loss.linearized_cone(surface_normals, w_tensor)
+        net_wrench = fc_loss.net_wrench(f, G)
+        int_fc = fc_loss.inter_fc(w_tensor)
+        sdf = (sdf_val**2).mean()
+        e_dist = relu(torch.linalg.norm(x_tensor.squeeze(0) - contact_target, dim=-1) - GENHAND_CONTACT_TARGET_TOL_M).sum()
+        inter_dist = _minimum_internal_distance_torch(x_tensor)
+        total = sdf + net_wrench + lin_ind + int_fc + 10.0 * e_dist + inter_dist
+        return {
+            "loss": total,
+            "sdf": sdf,
+            "net_wrench": net_wrench,
+            "lin_ind": lin_ind,
+            "int_fc": int_fc,
+            "distance": e_dist,
+            "inter_dist": inter_dist,
+        }
+
+    opt_fc = torch.optim.Adam([x, w], lr=GENHAND_FC_LR)
+    best = None
+    best_loss = float("inf")
+    for _ in range(GENHAND_FC_MAX_ITERS):
+        opt_fc.zero_grad()
+        data = fc_terms(x, w)
+        data["loss"].backward()
+        opt_fc.step()
+        loss_value = float(data["loss"].detach().cpu().item())
+        if loss_value < best_loss:
+            best_loss = loss_value
+            best = (
+                x.detach().clone(),
+                w.detach().clone(),
+                {k: float(v.detach().cpu().item()) for k, v in data.items()},
+            )
+        if (
+            torch.allclose(data["sdf"], torch.tensor(0.0, dtype=torch.float32), atol=5e-3)
+            and torch.allclose(data["net_wrench"], torch.tensor(0.0, dtype=torch.float32), atol=1e-3)
+            and torch.allclose(data["distance"], torch.tensor(0.0, dtype=torch.float32), atol=2e-2)
+            and torch.allclose(data["lin_ind"], torch.tensor(0.0, dtype=torch.float32), atol=1e-3)
+        ):
+            break
+
+    if best is not None:
+        x = best[0].requires_grad_(False)
+        w = best[1].requires_grad_(True)
+    opt_gf = torch.optim.Adam([w], lr=GENHAND_GF_LR)
+    for _ in range(GENHAND_GF_MAX_ITERS):
+        opt_gf.zero_grad()
+        data = fc_terms(x, w)
+        gf_loss = data["net_wrench"] + data["lin_ind"] + data["int_fc"]
+        gf_loss.backward()
+        opt_gf.step()
+        if torch.allclose(data["net_wrench"], torch.tensor(0.0, dtype=torch.float32), atol=1e-3):
+            break
+
+    final_points = np.asarray(x.detach().cpu().numpy()[0], dtype=np.float64)
+    projected_points, projected_normals = _project_targets_to_object_surface(config, final_points)
+    final_terms = fc_terms(x, w)
+    metrics = {
+        "fc_loss": float(final_terms["loss"].detach().cpu().item()),
+        "fc_net_wrench": float(final_terms["net_wrench"].detach().cpu().item()),
+        "fc_lin_ind": float(final_terms["lin_ind"].detach().cpu().item()),
+        "fc_intfc": float(final_terms["int_fc"].detach().cpu().item()),
+        "fc_distance": float(final_terms["distance"].detach().cpu().item()),
+        "fc_inter_dist": float(final_terms["inter_dist"].detach().cpu().item()),
+    }
+    return projected_points, projected_normals, metrics
+
+
+def _build_genhand_contact_target_obj(
+    config: TaskConfig,
+    object_pose_goal: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]] | None:
+    dense_pack = _dense_mano_contact_candidates_obj(
+        config=config,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
+        object_pose_goal=object_pose_goal,
+    )
+    if dense_pack is None:
+        return None
+    candidate_points, candidate_normals, _candidate_families, candidate_scores = dense_pack
+    target_count = len(GENHAND_ROBOT_CONTACT_CANDIDATES)
+    clustered_targets = _cluster_genhand_contact_targets_obj(
+        candidate_points_obj=candidate_points,
+        candidate_normals_obj=candidate_normals,
+        robot_contact_count=target_count,
+    )
+    if clustered_targets.size == 0:
+        return None
+    optimized_targets, optimized_normals, fc_metrics = _optimize_force_closure_targets_obj(
+        config=config,
+        initial_targets_obj=clustered_targets,
+    )
+    target_scores = np.linalg.norm(candidate_points[:, None, :] - optimized_targets[None, :, :], axis=2).min(axis=0)
+    fc_metrics.update(
+        {
+            "cluster_candidate_count": float(candidate_points.shape[0]),
+            "cluster_score_mean": float(np.mean(candidate_scores)) if candidate_scores.size > 0 else 0.0,
+            "target_anchor_count": float(optimized_targets.shape[0]),
+            "target_anchor_rmse_m": float(np.sqrt(np.mean(np.square(target_scores)))) if target_scores.size > 0 else 0.0,
+        }
+    )
+    return optimized_targets, optimized_normals, fc_metrics
 
 
 def _human_surface_contact_anchors_obj(
     config: TaskConfig,
-    source_keypoints_obj: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    candidate_points, candidate_families = _human_contact_candidate_points_obj(source_keypoints_obj)
-    projected_points, projected_normals = _project_targets_to_object_surface(config, candidate_points)
-    family_mask = np.ones(len(GENHAND_CONTACT_FAMILY_NAMES), dtype=np.float64)
-    return _cluster_points_to_surface_anchors(
-        projected_points,
-        projected_normals,
-        candidate_families,
-        family_mask,
-        GENHAND_ROBOT_FAMILY_CAPACITY,
+    object_pose_goal: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    if source_dgrasp_qpos_world is None:
+        raise RuntimeError("GenHand retargeting requires source D-Grasp qpos to reconstruct MANO contacts.")
+    built = _build_genhand_contact_target_obj(
+        config=config,
+        object_pose_goal=object_pose_goal,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
+    if built is None:
+        raise RuntimeError("Failed to build GenHand contact target from MANO candidates.")
+    return built
+
+
+def _kabsch_rigid_transform(source_points: np.ndarray, target_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    source = np.asarray(source_points, dtype=np.float64).reshape(-1, 3)
+    target = np.asarray(target_points, dtype=np.float64).reshape(-1, 3)
+    if source.shape[0] == 0 or target.shape[0] == 0 or source.shape[0] != target.shape[0]:
+        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+    source_centroid = np.mean(source, axis=0)
+    target_centroid = np.mean(target, axis=0)
+    h = (source - source_centroid).T @ (target - target_centroid)
+    u, _s, vt = np.linalg.svd(h)
+    rotation = vt.T @ u.T
+    if np.linalg.det(rotation) < 0.0:
+        vt[-1, :] *= -1.0
+        rotation = vt.T @ u.T
+    translation = target_centroid - rotation @ source_centroid
+    return rotation, translation
+
+
+def _normalize_point_cloud(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    cloud = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if cloud.size == 0:
+        return cloud.copy(), np.zeros(3, dtype=np.float64), 1.0
+    centroid = np.mean(cloud, axis=0)
+    centered = cloud - centroid
+    scale = float(np.linalg.norm(centered, axis=1).max())
+    if scale < 1e-8:
+        scale = 1.0
+    return centered / scale, centroid, scale
+
+
+def _apply_homogeneous_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    cloud = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if cloud.size == 0:
+        return cloud.copy()
+    rotation = np.asarray(transform[:3, :3], dtype=np.float64)
+    translation = np.asarray(transform[:3, 3], dtype=np.float64)
+    return (rotation @ cloud.T).T + translation
+
+
+def _kabsch_hungarian_assignment(
+    channel_centers: np.ndarray,
+    channel_normals: np.ndarray,
+    human_targets: np.ndarray,
+    human_normals: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    aligned_centers = channel_centers.copy()
+    assigned_targets = np.arange(channel_centers.shape[0], dtype=np.int64)
+    for _ in range(2):
+        position_cost = np.linalg.norm(aligned_centers[:, None, :] - human_targets[None, :, :], axis=2)
+        normal_cost = 0.05 * np.maximum(0.0, 1.0 - channel_normals @ human_normals.T)
+        row_ind, col_ind = linear_sum_assignment(position_cost + normal_cost)
+        row_ind = np.asarray(row_ind, dtype=np.int64)
+        col_ind = np.asarray(col_ind, dtype=np.int64)
+        assigned_targets[row_ind] = col_ind
+        rotation, translation = _kabsch_rigid_transform(channel_centers[row_ind], human_targets[col_ind])
+        aligned_centers = (rotation @ channel_centers.T).T + translation
+    return assigned_targets, aligned_centers
+
+
+def _laicp_channel_assignment(
+    channel_centers: np.ndarray,
+    channel_normals: np.ndarray,
+    human_targets: np.ndarray,
+    human_normals: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    icp_module = _load_genhand_icp_module()
+    if icp_module is None:
+        assigned_targets, aligned_centers = _kabsch_hungarian_assignment(
+            channel_centers=channel_centers,
+            channel_normals=channel_normals,
+            human_targets=human_targets,
+            human_normals=human_normals,
+        )
+        return assigned_targets, aligned_centers, {"anchor_assignment_norm_cost": 0.0, "anchor_assignment_method": 0.0}
+
+    current_centers = np.asarray(channel_centers, dtype=np.float64).copy()
+    assigned_targets = np.arange(channel_centers.shape[0], dtype=np.int64)
+    aligned_centers = current_centers.copy()
+    assignment_cost = 0.0
+
+    for _ in range(3):
+        robot_normed, _robot_centroid, _robot_scale = _normalize_point_cloud(current_centers)
+        target_normed, _target_centroid, _target_scale = _normalize_point_cloud(human_targets)
+
+        try:
+            transform, _distances, _iters, _indices = icp_module.icp(  # type: ignore[attr-defined]
+                robot_normed,
+                target_normed,
+                max_iterations=100,
+                tolerance=1e-6,
+            )
+        except Exception:
+            assigned_targets, aligned_centers = _kabsch_hungarian_assignment(
+                channel_centers=channel_centers,
+                channel_normals=channel_normals,
+                human_targets=human_targets,
+                human_normals=human_normals,
+            )
+            return assigned_targets, aligned_centers, {"anchor_assignment_norm_cost": 0.0, "anchor_assignment_method": 0.0}
+
+        robot_normed_aligned = _apply_homogeneous_transform(robot_normed, np.asarray(transform, dtype=np.float64))
+        position_cost = np.linalg.norm(robot_normed_aligned[:, None, :] - target_normed[None, :, :], axis=2)
+        normal_cost = 0.05 * np.maximum(0.0, 1.0 - channel_normals @ human_normals.T)
+        total_cost = position_cost + normal_cost
+        row_ind, col_ind = linear_sum_assignment(total_cost)
+        row_ind = np.asarray(row_ind, dtype=np.int64)
+        col_ind = np.asarray(col_ind, dtype=np.int64)
+
+        new_assigned_targets = np.arange(channel_centers.shape[0], dtype=np.int64)
+        new_assigned_targets[row_ind] = col_ind
+        rotation, translation = _kabsch_rigid_transform(channel_centers[row_ind], human_targets[col_ind])
+        new_aligned_centers = (rotation @ channel_centers.T).T + translation
+        new_assignment_cost = float(np.mean(total_cost[row_ind, col_ind])) if row_ind.size else 0.0
+
+        assigned_targets = new_assigned_targets
+        aligned_centers = new_aligned_centers
+        assignment_cost = new_assignment_cost
+        if np.array_equal(current_centers, aligned_centers):
+            break
+        current_centers = aligned_centers
+
+    return assigned_targets, aligned_centers, {"anchor_assignment_norm_cost": assignment_cost, "anchor_assignment_method": 1.0}
 
 
 def _assigned_contact_anchor_residuals(
-    robot_contact_points_obj: np.ndarray,
-    robot_contact_family_indices: np.ndarray,
+    robot_contact_point_sets_obj: np.ndarray,
+    robot_contact_normal_sets_obj: np.ndarray,
     human_contact_targets_obj: np.ndarray,
     human_contact_normals_obj: np.ndarray,
-    human_contact_family_indices: np.ndarray,
-) -> tuple[list[np.ndarray], dict[int, np.ndarray], dict[str, float]]:
-    robot_contact_points_obj = np.asarray(robot_contact_points_obj, dtype=np.float64).reshape(-1, 3)
-    robot_contact_family_indices = np.asarray(robot_contact_family_indices, dtype=np.int64).reshape(-1)
-    human_contact_targets_obj = np.asarray(human_contact_targets_obj, dtype=np.float64).reshape(-1, 3)
-    human_contact_normals_obj = np.asarray(human_contact_normals_obj, dtype=np.float64).reshape(-1, 3)
-    human_contact_family_indices = np.asarray(human_contact_family_indices, dtype=np.int64).reshape(-1)
+) -> tuple[list[np.ndarray], np.ndarray, dict[str, float]]:
+    robot_point_sets = np.asarray(robot_contact_point_sets_obj, dtype=np.float64).reshape(-1, robot_contact_point_sets_obj.shape[1], 3)
+    robot_normal_sets = np.asarray(robot_contact_normal_sets_obj, dtype=np.float64).reshape(-1, robot_contact_normal_sets_obj.shape[1], 3)
+    human_targets = np.asarray(human_contact_targets_obj, dtype=np.float64).reshape(-1, 3)
+    human_normals = np.asarray(human_contact_normals_obj, dtype=np.float64).reshape(-1, 3)
+
+    channel_count = robot_point_sets.shape[0]
+    target_count = human_targets.shape[0]
+    if channel_count == 0 or target_count == 0:
+        return [], np.zeros((0,), dtype=np.int64), {"anchor_rmse_m": 0.0, "anchor_max_error_m": 0.0, "anchor_pairs": 0.0}
+
+    if target_count != channel_count:
+        reduced_targets = _select_contact_targets_by_count_np(human_targets, human_normals, min(channel_count, target_count))
+        reduction_cost = np.linalg.norm(human_targets[:, None, :] - reduced_targets[None, :, :], axis=2)
+        keep_rows, keep_cols = linear_sum_assignment(reduction_cost)
+        keep_indices = keep_rows[np.argsort(keep_cols)]
+        human_targets = human_targets[keep_indices]
+        human_normals = human_normals[keep_indices]
+        target_count = human_targets.shape[0]
+    if channel_count != target_count:
+        channel_count = min(channel_count, target_count)
+        robot_point_sets = robot_point_sets[:channel_count]
+        robot_normal_sets = robot_normal_sets[:channel_count]
+        human_targets = human_targets[:channel_count]
+        human_normals = human_normals[:channel_count]
+
+    channel_centers = np.mean(robot_point_sets, axis=1)
+    channel_normals = np.asarray([normalize(np.mean(points, axis=0)) for points in robot_normal_sets], dtype=np.float64)
+
+    assigned_targets, aligned_centers, assignment_metrics = _laicp_channel_assignment(
+        channel_centers=channel_centers,
+        channel_normals=channel_normals,
+        human_targets=human_targets,
+        human_normals=human_normals,
+    )
 
     residuals: list[np.ndarray] = []
-    family_normal_targets: dict[int, np.ndarray] = {}
     assigned_error_norms: list[float] = []
-    assigned_pairs = 0
-
-    for family_idx, _family_name in enumerate(GENHAND_CONTACT_FAMILY_NAMES):
-        active_human_indices = np.flatnonzero(human_contact_family_indices == family_idx)
-        if active_human_indices.size == 0:
-            continue
-        family_robot_indices = np.flatnonzero(robot_contact_family_indices == family_idx)
-        if family_robot_indices.size == 0:
-            continue
-        family_robot_points = robot_contact_points_obj[family_robot_indices]
-        family_human_targets = human_contact_targets_obj[active_human_indices]
-        cost = np.linalg.norm(
-            family_human_targets[:, None, :] - family_robot_points[None, :, :],
-            axis=2,
-        )
-        row_ind, col_ind = linear_sum_assignment(cost)
-        row_ind = np.asarray(row_ind, dtype=np.int64)
-        col_ind = np.asarray(col_ind, dtype=np.int64)
-        kept_pairs = min(len(row_ind), len(col_ind))
-        if kept_pairs <= 0:
-            continue
-        robot_indices = family_robot_indices[col_ind[:kept_pairs]]
-        human_indices = active_human_indices[row_ind[:kept_pairs]]
-        diffs = robot_contact_points_obj[robot_indices] - human_contact_targets_obj[human_indices]
-        residuals.extend(list(diffs))
-        assigned_error_norms.extend(np.linalg.norm(diffs, axis=1).tolist())
-        assigned_pairs += int(len(robot_indices))
-        mean_normal = normalize(np.mean(human_contact_normals_obj[human_indices], axis=0))
-        if np.linalg.norm(mean_normal) > 1e-8:
-            family_normal_targets[family_idx] = mean_normal
+    for channel_idx, target_idx in enumerate(assigned_targets.tolist()):
+        target_point = human_targets[target_idx]
+        target_normal = human_normals[target_idx]
+        local_points = robot_point_sets[channel_idx]
+        local_normals = robot_normal_sets[channel_idx]
+        point_cost = np.linalg.norm(local_points - target_point[None, :], axis=1)
+        normal_cost = 0.02 * np.maximum(0.0, 1.0 - np.sum(local_normals * target_normal[None, :], axis=1))
+        best_local_idx = int(np.argmin(point_cost + normal_cost))
+        diff = local_points[best_local_idx] - target_point
+        residuals.append(diff)
+        assigned_error_norms.append(float(np.linalg.norm(diff)))
 
     metrics = {
         "anchor_rmse_m": float(np.sqrt(np.mean(np.square(assigned_error_norms)))) if assigned_error_norms else 0.0,
         "anchor_max_error_m": float(np.max(assigned_error_norms)) if assigned_error_norms else 0.0,
-        "anchor_pairs": float(assigned_pairs),
+        "anchor_pairs": float(len(residuals)),
+        **assignment_metrics,
     }
-    return residuals, family_normal_targets, metrics
+    return residuals, assigned_targets, metrics
 
 
 def _contact_anchor_metrics_obj(
-    robot_contact_points_obj: np.ndarray,
-    robot_contact_family_indices: np.ndarray,
-    source_keypoints_obj: np.ndarray,
-    source_contact_mask_12: np.ndarray,
+    robot_contact_point_sets_obj: np.ndarray,
+    robot_contact_normal_sets_obj: np.ndarray,
     config: TaskConfig,
+    object_pose_goal: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
 ) -> dict[str, float]:
-    human_targets, human_normals, human_families = _human_surface_contact_anchors_obj(
-        config,
-        source_keypoints_obj,
+    human_targets, human_normals, fc_metrics = _human_surface_contact_anchors_obj(
+        config=config,
+        object_pose_goal=object_pose_goal,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
-    family_mask = _source_contact_family_mask(source_contact_mask_12)
-    active_human_indices = np.flatnonzero(family_mask[human_families] > 0.5)
-    if active_human_indices.size > 0:
-        human_targets = human_targets[active_human_indices]
-        human_normals = human_normals[active_human_indices]
-        human_families = human_families[active_human_indices]
-    _, _, metrics = _assigned_contact_anchor_residuals(
-        robot_contact_points_obj=robot_contact_points_obj,
-        robot_contact_family_indices=robot_contact_family_indices,
+    _residuals, _assigned_targets, metrics = _assigned_contact_anchor_residuals(
+        robot_contact_point_sets_obj=robot_contact_point_sets_obj,
+        robot_contact_normal_sets_obj=robot_contact_normal_sets_obj,
         human_contact_targets_obj=human_targets,
         human_contact_normals_obj=human_normals,
-        human_contact_family_indices=human_families,
     )
+    metrics.update({f"genhand_{key}": float(value) for key, value in fc_metrics.items()})
     return metrics
+
+
+def _candidate_contact_anchor_metrics(
+    candidate: dict[str, Any],
+    object_pose_goal: np.ndarray,
+    human_contact_targets_obj: np.ndarray,
+    human_contact_normals_obj: np.ndarray,
+) -> dict[str, float]:
+    point_sets_world = np.asarray(candidate["contact_candidate_point_sets_world"], dtype=np.float64)
+    normal_sets_world = np.asarray(candidate["contact_candidate_normal_sets_world"], dtype=np.float64)
+    point_sets_obj = transform_points(
+        point_sets_world.reshape(-1, 3),
+        inverse_pose7(object_pose_goal),
+    ).reshape(point_sets_world.shape)
+    inv_object_rotation = quat_wxyz_to_matrix(inverse_pose7(object_pose_goal)[3:])
+    normal_sets_obj = np.einsum("ij,ksj->ksi", inv_object_rotation, normal_sets_world)
+    _residuals, _assigned_targets, metrics = _assigned_contact_anchor_residuals(
+        robot_contact_point_sets_obj=point_sets_obj,
+        robot_contact_normal_sets_obj=normal_sets_obj,
+        human_contact_targets_obj=human_contact_targets_obj,
+        human_contact_normals_obj=human_contact_normals_obj,
+    )
+    return {str(k): float(v) for k, v in metrics.items()}
 
 
 def _box_genhand_seed_states(
@@ -1056,26 +1658,21 @@ def _box_genhand_seed_states(
     source_semantic_sites_world: np.ndarray,
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
     base_hand_qpos: np.ndarray,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    del source_contact_mask_12
+    del source_keypoints_obj
     source_wrist_pose_object = compose_pose7(inverse_pose7(object_pose_goal), source_wrist_pose_world)
     source_semantic_sites_obj = transform_points(source_semantic_sites_world, inverse_pose7(object_pose_goal))
     source_frame_obj = semantic_frame_from_sites(source_semantic_sites_obj)
-    source_contact_targets_obj, source_contact_normals_obj, source_contact_families = _human_surface_contact_anchors_obj(
-        config,
-        source_keypoints_obj,
+    source_contact_targets_obj, source_contact_normals_obj, _fc_metrics = _human_surface_contact_anchors_obj(
+        config=config,
+        object_pose_goal=object_pose_goal,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
-    family_mask = _source_contact_family_mask(source_contact_mask_12)
-    active_anchor_indices = np.flatnonzero(family_mask[source_contact_families] > 0.5)
-    contact_centroid = (
-        np.mean(source_contact_targets_obj[active_anchor_indices], axis=0)
-        if active_anchor_indices.size > 0
-        else source_semantic_sites_obj[1]
-    )
-    if active_anchor_indices.size > 0:
-        averaged_normal = normalize(np.mean(source_contact_normals_obj[active_anchor_indices], axis=0))
-    else:
-        averaged_normal = -source_frame_obj[:, 2]
+    contact_centroid = np.mean(source_contact_targets_obj, axis=0) if source_contact_targets_obj.size else source_semantic_sites_obj[1]
+    averaged_normal = normalize(np.mean(source_contact_normals_obj, axis=0)) if source_contact_normals_obj.size else -source_frame_obj[:, 2]
     if np.linalg.norm(averaged_normal) < 1e-8:
         averaged_normal = -source_frame_obj[:, 2]
     desired_approach = -averaged_normal
@@ -1086,17 +1683,21 @@ def _box_genhand_seed_states(
     across = normalize(across)
     normal = normalize(np.cross(across, desired_approach))
     across = normalize(np.cross(desired_approach, normal))
-    contact_biased_hand = runtime.clamp_hand(np.asarray(base_hand_qpos, dtype=np.float64) + _finger_contact_bias_from_mask(source_contact_mask_12))
-    aggressive_hand = runtime.clamp_hand(np.asarray(base_hand_qpos, dtype=np.float64) + 1.25 * _finger_contact_bias_from_mask(source_contact_mask_12))
+    seed_variants = _genhand_hand_seed_variants(runtime, base_hand_qpos)
+    relaxed_hand = seed_variants["relaxed"]
+    contact_biased_hand = seed_variants["balanced"]
+    aggressive_hand = seed_variants["aggressive"]
+    thumb_lead_hand = seed_variants["thumb_lead"]
 
     seeds: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = [
-        (np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), runtime.clamp_hand(base_hand_qpos)),
+        (np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), relaxed_hand),
         (np.array([0.0, 0.0, -0.004], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
         (np.array([0.0, 0.0, 0.004], dtype=np.float64), np.zeros(3, dtype=np.float64), aggressive_hand),
         (np.array([0.006, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([0.0, -6.0, 0.0], dtype=np.float64)), contact_biased_hand),
         (np.array([-0.006, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([0.0, 6.0, 0.0], dtype=np.float64)), contact_biased_hand),
         (np.array([0.0, 0.008, 0.0], dtype=np.float64), np.deg2rad(np.array([4.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
         (np.array([0.0, -0.008, 0.0], dtype=np.float64), np.deg2rad(np.array([-4.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
+        (np.array([0.0, 0.0, -0.002], dtype=np.float64), np.deg2rad(np.array([0.0, 0.0, 8.0], dtype=np.float64)), thumb_lead_hand),
     ]
 
     target_pose_object = np.eye(4, dtype=np.float64)
@@ -1110,148 +1711,6 @@ def _box_genhand_seed_states(
     return seeds
 
 
-def _optimize_contact_direction_seed(
-    runtime: RobotSceneModel,
-    config: TaskConfig,
-    object_pose_goal: np.ndarray,
-    source_wrist_pose_world: np.ndarray,
-    source_semantic_sites_world: np.ndarray,
-    source_keypoints_obj: np.ndarray,
-    source_contact_mask_12: np.ndarray,
-    initial_translation_local: np.ndarray,
-    initial_rotvec_local: np.ndarray,
-    initial_hand_qpos: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    source_contact_targets_obj = _human_contact_target_points_obj(source_keypoints_obj)
-    source_finger_dirs_obj = _human_finger_directions_obj(source_keypoints_obj)
-    source_semantic_sites_obj = transform_points(source_semantic_sites_world, inverse_pose7(object_pose_goal))
-    object_rotation = quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64))
-    inv_object_rotation = object_rotation.T
-    table_top_z = runtime.get_table_top_z()
-    group_presence = _contact_group_presence(source_contact_mask_12)
-    active_contact_indices = np.flatnonzero(np.asarray(source_contact_mask_12, dtype=np.float64) > 0.5)
-    active_fingers = [
-        bool(group_presence[1] > 0.5),
-        bool(group_presence[2] > 0.5),
-        bool(group_presence[3] > 0.5),
-        bool(group_presence[4] > 0.5),
-        bool(group_presence[5] > 0.5),
-    ]
-
-    initial_translation_local = np.asarray(initial_translation_local, dtype=np.float64)
-    initial_rotvec_local = np.asarray(initial_rotvec_local, dtype=np.float64)
-    initial_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
-    x0 = np.concatenate([initial_translation_local, initial_rotvec_local, initial_hand_qpos])
-
-    lower = np.concatenate(
-        [
-            initial_translation_local - np.array([0.06, 0.06, 0.08], dtype=np.float64),
-            initial_rotvec_local - np.deg2rad(np.array([35.0, 35.0, 55.0], dtype=np.float64)),
-            runtime.hand_lower,
-        ]
-    )
-    upper = np.concatenate(
-        [
-            initial_translation_local + np.array([0.06, 0.06, 0.08], dtype=np.float64),
-            initial_rotvec_local + np.deg2rad(np.array([35.0, 35.0, 55.0], dtype=np.float64)),
-            runtime.hand_upper,
-        ]
-    )
-
-    def objective(x: np.ndarray) -> np.ndarray:
-        translation_local = np.asarray(x[:3], dtype=np.float64)
-        rotvec_local = np.asarray(x[3:6], dtype=np.float64)
-        hand_qpos = runtime.clamp_hand(np.asarray(x[6:], dtype=np.float64))
-        target_wrist_pose = apply_local_pose_delta(source_wrist_pose_world, translation_local, rotvec_local)
-        arm_qpos = solve_arm_wrist_palm_ik(
-            runtime=runtime,
-            target_wrist_pose_world=target_wrist_pose,
-            initial_arm_qpos=runtime.home_actuated[:6],
-            hand_qpos=hand_qpos,
-            iterations=max(36, int(config.conversion.arm_ik_iterations * 0.4)),
-            damping=config.conversion.arm_ik_damping,
-        )
-        runtime.reset()
-        runtime.set_object_pose(object_pose_goal)
-        runtime.set_robot_actuated_qpos(np.concatenate([arm_qpos, hand_qpos]))
-
-        contact_points_world = runtime.get_contact_proxy_points_world_12()
-        contact_points_obj = transform_points(contact_points_world, inverse_pose7(object_pose_goal))
-        finger_dirs_world = runtime.get_finger_directions_world()
-        finger_dirs_obj = (inv_object_rotation @ finger_dirs_world.T).T
-        semantic_sites_world = runtime.get_semantic_sites_world()
-        semantic_sites_obj = transform_points(semantic_sites_world, inverse_pose7(object_pose_goal))
-        diag = runtime.get_contact_diagnostics_12()
-        distances = np.asarray(diag["distances_m"], dtype=np.float64)
-        table_clearance = runtime.get_proxy_table_clearance_12()
-
-        residuals: list[float] = []
-        for group_idx in active_contact_indices.tolist():
-            residuals.extend(
-                (
-                    CONTACT_DRIVEN_POSITION_WEIGHT
-                    * (contact_points_obj[group_idx] - source_contact_targets_obj[group_idx])
-                ).tolist()
-            )
-
-        residuals.extend(
-            (CONTACT_DRIVEN_PALM_WEIGHT * (semantic_sites_obj[1] - source_semantic_sites_obj[1])).tolist()
-        )
-
-        for finger_idx, is_active in enumerate(active_fingers):
-            if not is_active:
-                continue
-            residuals.extend(
-                (
-                    CONTACT_DRIVEN_DIRECTION_WEIGHT
-                    * (finger_dirs_obj[finger_idx] - source_finger_dirs_obj[finger_idx])
-                ).tolist()
-            )
-
-        penetration = np.maximum(-distances, 0.0)
-        residuals.extend((CONTACT_DRIVEN_PENETRATION_WEIGHT * penetration).tolist())
-
-        semantic_clearance = np.array(
-            [
-                semantic_sites_world[0, 2] - table_top_z,
-                semantic_sites_world[1, 2] - table_top_z,
-            ],
-            dtype=np.float64,
-        )
-        table_violation = np.maximum(0.002 - np.concatenate([table_clearance, semantic_clearance]), 0.0)
-        residuals.extend((CONTACT_DRIVEN_TABLE_WEIGHT * table_violation).tolist())
-
-        residuals.extend((CONTACT_DRIVEN_WRIST_REG_WEIGHT * (translation_local - initial_translation_local)).tolist())
-        residuals.extend((0.20 * (rotvec_local - initial_rotvec_local)).tolist())
-        residuals.extend((CONTACT_DRIVEN_HAND_REG_WEIGHT * (hand_qpos - initial_hand_qpos)).tolist())
-
-        if config.object_geom_type == "cylinder":
-            palm_clearance_error_m, opposition_cos = _cylinder_grasp_geometry_metrics(
-                config,
-                object_pose_goal,
-                semantic_sites_world,
-                source_contact_mask_12,
-            )
-            residuals.append(6.0 * max(0.0, palm_clearance_error_m - PROJECTION_CYLINDER_PALM_CLEARANCE_TOL_M))
-            residuals.append(2.0 * max(0.0, opposition_cos - PROJECTION_CYLINDER_OPPOSITION_TARGET_COS))
-
-        return np.asarray(residuals, dtype=np.float64)
-
-    result = least_squares(
-        objective,
-        x0,
-        bounds=(lower, upper),
-        max_nfev=CONTACT_DRIVEN_MAX_NFEV,
-    )
-    optimized = np.asarray(result.x, dtype=np.float64)
-    return (
-        optimized[:3].copy(),
-        optimized[3:6].copy(),
-        runtime.clamp_hand(optimized[6:]).copy(),
-        float(result.cost),
-    )
-
-
 def _optimize_genhand_seed(
     runtime: RobotSceneModel,
     config: TaskConfig,
@@ -1260,22 +1719,18 @@ def _optimize_genhand_seed(
     source_semantic_sites_world: np.ndarray,
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
     initial_translation_local: np.ndarray,
     initial_rotvec_local: np.ndarray,
     initial_hand_qpos: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     source_wrist_pose_object = compose_pose7(inverse_pose7(object_pose_goal), source_wrist_pose_world)
     source_semantic_sites_obj = transform_points(source_semantic_sites_world, inverse_pose7(object_pose_goal))
-    source_contact_targets_obj, source_contact_normals_obj, source_contact_families = _human_surface_contact_anchors_obj(
-        config,
-        source_keypoints_obj,
+    source_contact_targets_obj, source_contact_normals_obj, _fc_metrics = _human_surface_contact_anchors_obj(
+        config=config,
+        object_pose_goal=object_pose_goal,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
-    family_mask = _source_contact_family_mask(source_contact_mask_12)
-    active_anchor_indices = np.flatnonzero(family_mask[source_contact_families] > 0.5)
-    if active_anchor_indices.size > 0:
-        source_contact_targets_obj = source_contact_targets_obj[active_anchor_indices]
-        source_contact_normals_obj = source_contact_normals_obj[active_anchor_indices]
-        source_contact_families = source_contact_families[active_anchor_indices]
     source_finger_dirs_obj = _human_finger_directions_obj(source_keypoints_obj)
     object_rotation = quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64))
     inv_object_rotation = object_rotation.T
@@ -1324,8 +1779,16 @@ def _optimize_genhand_seed(
         runtime.set_object_pose(object_pose_goal)
         runtime.set_robot_actuated_qpos(np.concatenate([arm_qpos, hand_qpos]))
 
-        contact_candidate_points_world, contact_candidate_families = runtime.get_contact_candidate_points_world()
-        contact_candidate_points_obj = transform_points(contact_candidate_points_world, inverse_pose7(object_pose_goal))
+        contact_candidate_point_sets_world, contact_candidate_normal_sets_world, _contact_candidate_families = runtime.get_contact_candidate_point_sets_world()
+        contact_candidate_point_sets_obj = transform_points(
+            contact_candidate_point_sets_world.reshape(-1, 3),
+            inverse_pose7(object_pose_goal),
+        ).reshape(contact_candidate_point_sets_world.shape)
+        contact_candidate_normal_sets_obj = np.einsum(
+            "ij,ksj->ksi",
+            inv_object_rotation,
+            np.asarray(contact_candidate_normal_sets_world, dtype=np.float64),
+        )
         finger_dirs_world = runtime.get_finger_directions_world()
         finger_dirs_obj = (inv_object_rotation @ finger_dirs_world.T).T
         semantic_sites_world = runtime.get_semantic_sites_world()
@@ -1341,48 +1804,35 @@ def _optimize_genhand_seed(
             arm_table_clearance_m=arm_table_clearance,
         )
 
-        anchor_residuals, family_normal_targets, _ = _assigned_contact_anchor_residuals(
-            robot_contact_points_obj=contact_candidate_points_obj,
-            robot_contact_family_indices=contact_candidate_families,
+        anchor_residuals, assigned_targets, _ = _assigned_contact_anchor_residuals(
+            robot_contact_point_sets_obj=contact_candidate_point_sets_obj,
+            robot_contact_normal_sets_obj=contact_candidate_normal_sets_obj,
             human_contact_targets_obj=source_contact_targets_obj,
             human_contact_normals_obj=source_contact_normals_obj,
-            human_contact_family_indices=source_contact_families,
         )
 
         residuals: list[float] = []
         for diff in anchor_residuals:
             residuals.extend((GENHAND_ANCHOR_POSITION_WEIGHT * diff).tolist())
 
-        for family_idx, mean_normal in family_normal_targets.items():
-            if family_idx == 0:
-                continue
-            finger_idx = CONTACT_FAMILY_TO_FINGER_INDEX[family_idx]
-            desired_dir = normalize(0.60 * source_finger_dirs_obj[finger_idx] + 0.40 * (-mean_normal))
-            residuals.extend((GENHAND_DIRECTION_WEIGHT * (finger_dirs_obj[finger_idx] - desired_dir)).tolist())
+        for finger_idx in range(min(len(finger_dirs_obj), len(source_finger_dirs_obj))):
+            residuals.extend((GENHAND_DIRECTION_WEIGHT * (finger_dirs_obj[finger_idx] - source_finger_dirs_obj[finger_idx])).tolist())
 
-        if family_normal_targets:
-            active_normals = np.asarray(list(family_normal_targets.values()), dtype=np.float64)
-            desired_palm_approach = -normalize(np.mean(active_normals, axis=0))
-        else:
-            desired_palm_approach = semantic_frame_from_sites(source_semantic_sites_obj)[:, 2]
+        desired_palm_approach = -normalize(np.mean(source_contact_normals_obj, axis=0)) if source_contact_normals_obj.size else semantic_frame_from_sites(source_semantic_sites_obj)[:, 2]
         current_palm_approach = semantic_frame_obj[:, 2]
         residuals.extend((GENHAND_PALM_DIRECTION_WEIGHT * (current_palm_approach - desired_palm_approach)).tolist())
         residuals.extend((GENHAND_PALM_POSITION_WEIGHT * (semantic_sites_obj[1] - source_semantic_sites_obj[1])).tolist())
         residuals.extend((GENHAND_WRIST_POSITION_WEIGHT * (semantic_sites_obj[0] - source_semantic_sites_obj[0])).tolist())
 
-        active_distance_penalty = []
-        for family_idx, group_indices in enumerate(CONTACT_FAMILY_GROUPS_12):
-            active_group_indices = [idx for idx in group_indices if np.asarray(source_contact_mask_12, dtype=np.float64)[idx] > 0.5]
-            if not active_group_indices:
-                continue
-            active_distance_penalty.extend(
-                np.maximum(
-                    distances[active_group_indices]
-                    - np.asarray([SEMANTIC_CONTACT_DISTANCE_THRESHOLDS_M[idx] for idx in active_group_indices], dtype=np.float64),
-                    0.0,
+        if source_contact_targets_obj.size:
+            aligned_targets = source_contact_targets_obj[np.asarray(assigned_targets, dtype=np.int64)]
+            aligned_centers = np.mean(contact_candidate_point_sets_obj, axis=1)
+            residuals.extend(
+                (
+                    GENHAND_ACTIVE_DISTANCE_WEIGHT
+                    * np.linalg.norm(aligned_centers - aligned_targets, axis=1)
                 ).tolist()
             )
-        residuals.extend((GENHAND_ACTIVE_DISTANCE_WEIGHT * np.asarray(active_distance_penalty, dtype=np.float64)).tolist())
 
         penetration = np.maximum(-distances, 0.0)
         residuals.extend((GENHAND_PENETRATION_WEIGHT * penetration).tolist())
@@ -1461,27 +1911,9 @@ def _optimize_hand_qpos(
     return runtime.clamp_hand(result.x), float(result.cost)
 
 
-def _finger_contact_bias_from_mask(source_contact_mask_12: np.ndarray) -> np.ndarray:
-    contact_mask = np.asarray(source_contact_mask_12, dtype=np.float64).reshape(12)
-    active = np.array(
-        [
-            float(contact_mask[1:4].max() > 0.5),
-            float(contact_mask[1:4].max() > 0.5),
-            float(contact_mask[4:6].max() > 0.5),
-            float(contact_mask[6:8].max() > 0.5),
-            float(contact_mask[8:10].max() > 0.5),
-            float(contact_mask[10:12].max() > 0.5),
-        ],
-        dtype=np.float64,
-    )
-    squeeze = np.array([0.04, 0.14, 0.12, 0.12, 0.12, 0.12], dtype=np.float64) * active
-    open_non_target = np.array([0.0, 0.06, 0.08, 0.08, 0.08, 0.08], dtype=np.float64) * (1.0 - active)
-    return squeeze - open_non_target
-
-
-def _required_target_contact_count(source_contact_mask_12: np.ndarray) -> int:
-    positive_contacts = int(np.sum(np.asarray(source_contact_mask_12, dtype=np.float64) > 0.5))
-    return min(2, positive_contacts)
+def _required_target_contact_count(source_contact_mask_12: np.ndarray | None = None) -> int:
+    del source_contact_mask_12
+    return min(2, len(GENHAND_CONTACT_FAMILY_NAMES))
 
 
 def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> tuple[float, ...]:
@@ -1520,7 +1952,9 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         + 80.0 * hard_translation_drift_over
         + 2.0 * hard_rotation_drift_over
     )
-    required_contact_shortfall = max(0.0, float(required_contacts) - matched_contacts)
+    settled_contact_shortfall = max(0.0, 2.0 - float(candidate.get("settled_contact_group_count", 0.0)))
+    settled_hard_shortfall = max(0.0, 1.0 - float(candidate.get("settled_hard_contact_group_count", 0.0)))
+    settled_opposition_missing = 0.0 if bool(candidate.get("settled_has_thumb_opposition", False)) else 1.0
     hold_drop_over = max(0.0, float(candidate["hold_object_drop_m"]) - PROJECTION_HOLD_MAX_DROP_M)
     hold_translation_over = max(0.0, float(candidate["hold_object_translation_m"]) - PROJECTION_HOLD_MAX_TRANSLATION_M)
     hold_rotation_over = max(0.0, float(candidate["hold_object_rotation_deg"]) - PROJECTION_HOLD_MAX_ROTATION_DEG)
@@ -1528,7 +1962,6 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
     hold_hybrid_shortfall = max(0.0, 2.0 - float(candidate["hold_hybrid_contact_group_count"]))
     hold_hard_shortfall = max(0.0, 1.0 - float(candidate["hold_hard_contact_group_count"]))
     hold_opposition_missing = 0.0 if bool(candidate["hold_has_thumb_opposition"]) else 1.0
-    hold_match_shortfall = max(0.0, float(required_contacts) - float(candidate["hold_matched_target_contacts"]))
     reach_object_shortfall = max(
         0.0,
         REACHABILITY_MIN_OBJECT_FACING_COS - float(candidate.get("reach_object_facing_cos", 1.0)),
@@ -1559,7 +1992,20 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         + 6.0 * hold_hybrid_shortfall
         + 4.0 * hold_hard_shortfall
         + 3.0 * hold_opposition_missing
-        + 2.0 * hold_match_shortfall
+    )
+    fc_quality_violation = (
+        16.0 * float(candidate.get("genhand_target_anchor_rmse_m", 0.0))
+        + 1.5 * float(candidate.get("genhand_cluster_score_mean", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_net_wrench", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_lin_ind", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_intfc", 0.0))
+        + 4.0 * float(candidate.get("anchor_assignment_norm_cost", 0.0))
+        + 2.0 * float(candidate.get("anchor_rmse_m", 0.0))
+    )
+    kinematic_quality_violation = (
+        0.10 * float(candidate.get("teacher_cost", 0.0))
+        + 2.0 * float(candidate["source_site_rmse_m"])
+        + 0.010 * float(candidate["source_semantic_frame_error_deg"])
     )
     cylinder_wrap_violation = 0.0
     if is_cylinder:
@@ -1593,14 +2039,14 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         return (
             0.0,
             reachability_violation,
+            fc_quality_violation,
+            kinematic_quality_violation,
             hold_quality_violation,
             cylinder_wrap_violation,
-            required_contact_shortfall,
-            -matched_contacts,
+            settled_contact_shortfall,
+            settled_hard_shortfall,
+            settled_opposition_missing,
             soft_safety_violation,
-            extra_contacts,
-            float(candidate["source_site_rmse_m"]),
-            float(candidate["source_semantic_frame_error_deg"]),
             object_translation_drift,
             max_penetration,
             float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
@@ -1610,16 +2056,63 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         1.0,
         hard_safety_violation,
         reachability_violation,
+        fc_quality_violation,
+        kinematic_quality_violation,
         hold_quality_violation,
         cylinder_wrap_violation,
-        required_contact_shortfall,
-        -matched_contacts,
+        settled_contact_shortfall,
+        settled_hard_shortfall,
+        settled_opposition_missing,
         soft_safety_violation,
-        extra_contacts,
-        float(candidate["source_site_rmse_m"]),
-        float(candidate["source_semantic_frame_error_deg"]),
         object_translation_drift,
         max_penetration,
+        float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
+        float(np.linalg.norm(np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64))),
+    )
+
+
+def _projection_preshortlist_rank_key(candidate: dict[str, Any], required_contacts: int) -> tuple[float, ...]:
+    table_contact = 1.0 if bool(candidate["table_contact"]) else 0.0
+    hard_safety_violation = (
+        10.0 * table_contact
+        + 600.0 * max(0.0, float(candidate["max_penetration_m"]) - PROJECTION_HARD_MAX_PENETRATION_M)
+        + 120.0 * max(0.0, float(candidate["total_penetration_m"]) - PROJECTION_HARD_TOTAL_PENETRATION_M)
+        + 80.0 * max(0.0, float(candidate["object_translation_drift_m"]) - PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M)
+        + 2.0 * max(0.0, float(candidate["object_rotation_drift_deg"]) - PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG)
+    )
+    reachability_violation = (
+        8.0 * max(0.0, REACHABILITY_MIN_OBJECT_FACING_COS - float(candidate.get("reach_object_facing_cos", 1.0)))
+        + 8.0 * max(0.0, float(candidate.get("reach_base_facing_cos", -1.0)) - REACHABILITY_MAX_BASE_FACING_COS)
+        + 6.0 * max(0.0, REACHABILITY_MIN_DOWNWARD_APPROACH - float(candidate.get("reach_downward_component", 1.0)))
+        + 40.0 * max(0.0, REACHABILITY_MIN_ARM_TABLE_CLEARANCE_M - float(candidate.get("reach_min_arm_table_clearance_m", 1.0)))
+    )
+    fc_quality_violation = (
+        16.0 * float(candidate.get("genhand_target_anchor_rmse_m", 0.0))
+        + 1.5 * float(candidate.get("genhand_cluster_score_mean", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_net_wrench", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_lin_ind", 0.0))
+        + 0.50 * float(candidate.get("genhand_fc_intfc", 0.0))
+        + 4.0 * float(candidate.get("anchor_assignment_norm_cost", 0.0))
+        + 2.0 * float(candidate.get("anchor_rmse_m", 0.0))
+    )
+    kinematic_quality_violation = (
+        0.10 * float(candidate.get("teacher_cost", 0.0))
+        + 2.0 * float(candidate["source_site_rmse_m"])
+        + 0.010 * float(candidate["source_semantic_frame_error_deg"])
+    )
+    settled_contact_shortfall = max(0.0, 2.0 - float(candidate.get("settled_contact_group_count", 0.0)))
+    settled_hard_shortfall = max(0.0, 1.0 - float(candidate.get("settled_hard_contact_group_count", 0.0)))
+    settled_opposition_missing = 0.0 if bool(candidate.get("settled_has_thumb_opposition", False)) else 1.0
+    return (
+        hard_safety_violation,
+        reachability_violation,
+        fc_quality_violation,
+        kinematic_quality_violation,
+        settled_contact_shortfall,
+        settled_hard_shortfall,
+        settled_opposition_missing,
+        float(candidate["object_translation_drift_m"]),
+        float(candidate["max_penetration_m"]),
         float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
         float(np.linalg.norm(np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64))),
     )
@@ -1711,7 +2204,11 @@ def _evaluate_projected_candidate(
     final_proximity_scores = settled_proximity_scores.copy()
     final_contact_distances = settled_contact_distances.copy()
     final_contact_points_world = runtime.get_contact_proxy_points_world_12().copy()
-    final_contact_candidate_points_world, final_contact_candidate_families = runtime.get_contact_candidate_points_world()
+    (
+        final_contact_candidate_point_sets_world,
+        final_contact_candidate_normal_sets_world,
+        final_contact_candidate_families,
+    ) = runtime.get_contact_candidate_point_sets_world()
     final_object_frame = quat_wxyz_to_matrix(final_object_pose[3:])
 
     wrist_error = float(np.linalg.norm(final_sites[0] - source_semantic_sites_world[0]))
@@ -1773,10 +2270,6 @@ def _evaluate_projected_candidate(
         site_rmse
         + 28.0 * float(final_contact_diag["total_penetration_m"])
         + 48.0 * float(final_contact_diag["max_penetration_m"])
-        + 0.200 * contact_shortfall
-        + 0.030 * target_contact_misses
-        + 0.010 * extra_contacts
-        - 0.020 * matched_target_contacts
         + 0.02 * float(bool(final_contact_diag["table_contact"]))
         + 0.20 * translation_norm
         + 0.05 * rotation_norm
@@ -1799,7 +2292,6 @@ def _evaluate_projected_candidate(
         + 1.50 * float(max(0.0, 2.0 - hold_hybrid_contact_group_count))
         + 1.00 * float(max(0.0, 1.0 - hold_hard_contact_group_count))
         + 1.50 * float(not hold_has_thumb_opposition)
-        + 0.40 * float(max(0.0, float(required_contacts) - hold_matched_target_contacts))
         + 6.0 * max(0.0, hold_cylinder_palm_clearance_error_m - PROJECTION_CYLINDER_HOLD_PALM_CLEARANCE_TOL_M)
         + 2.00 * max(0.0, hold_cylinder_opposition_cos - PROJECTION_CYLINDER_HOLD_OPPOSITION_TARGET_COS)
         - 0.03 * hold_hard_contact_group_count
@@ -1823,7 +2315,9 @@ def _evaluate_projected_candidate(
         "contact_proximity_score_12": final_proximity_scores.copy(),
         "contact_distance_12_m": final_contact_distances.copy(),
         "contact_points_world_12": final_contact_points_world.copy(),
-        "contact_candidate_points_world": np.asarray(final_contact_candidate_points_world, dtype=np.float64).copy(),
+        "contact_candidate_point_sets_world": np.asarray(final_contact_candidate_point_sets_world, dtype=np.float64).copy(),
+        "contact_candidate_normal_sets_world": np.asarray(final_contact_candidate_normal_sets_world, dtype=np.float64).copy(),
+        "contact_candidate_points_world": np.asarray(final_contact_candidate_point_sets_world, dtype=np.float64).reshape(-1, 3).copy(),
         "contact_candidate_family_indices": np.asarray(final_contact_candidate_families, dtype=np.int64).copy(),
         "contact_forces_12": np.asarray(final_contact_diag["forces"], dtype=np.float64).copy(),
         "table_contact": bool(final_contact_diag["table_contact"]),
@@ -1866,89 +2360,6 @@ def _evaluate_projected_candidate(
     }
 
 
-def _coordinate_descent_projected_candidate(
-    runtime: RobotSceneModel,
-    config: TaskConfig,
-    object_pose_goal: np.ndarray,
-    source_wrist_pose_world: np.ndarray,
-    source_semantic_sites_world: np.ndarray,
-    source_contact_mask_12: np.ndarray,
-    best: dict[str, Any],
-    required_contacts: int,
-    translation_steps: np.ndarray,
-    rotation_steps: np.ndarray,
-    hand_steps: np.ndarray,
-    passes: int,
-) -> dict[str, Any]:
-    for _ in range(max(1, int(passes))):
-        improved = False
-
-        for axis in range(3):
-            for direction in (-1.0, 1.0):
-                candidate_translation = np.asarray(best["wrist_translation_local"], dtype=np.float64).copy()
-                candidate_translation[axis] += direction * translation_steps[axis]
-                candidate = _evaluate_projected_candidate(
-                    runtime=runtime,
-                    config=config,
-                    object_pose_goal=object_pose_goal,
-                    source_wrist_pose_world=source_wrist_pose_world,
-                    source_semantic_sites_world=source_semantic_sites_world,
-                    source_contact_mask_12=source_contact_mask_12,
-                    wrist_translation_local=candidate_translation,
-                    wrist_rotvec_local=np.asarray(best["wrist_rotvec_local"], dtype=np.float64),
-                    hand_qpos=np.asarray(best["hand_qpos"], dtype=np.float64),
-                    run_hold_test=False,
-                )
-                if _is_better_projected_candidate(candidate, best, required_contacts):
-                    best = candidate
-                    improved = True
-
-        for axis in range(3):
-            for direction in (-1.0, 1.0):
-                candidate_rotvec = np.asarray(best["wrist_rotvec_local"], dtype=np.float64).copy()
-                candidate_rotvec[axis] += direction * rotation_steps[axis]
-                candidate = _evaluate_projected_candidate(
-                    runtime=runtime,
-                    config=config,
-                    object_pose_goal=object_pose_goal,
-                    source_wrist_pose_world=source_wrist_pose_world,
-                    source_semantic_sites_world=source_semantic_sites_world,
-                    source_contact_mask_12=source_contact_mask_12,
-                    wrist_translation_local=np.asarray(best["wrist_translation_local"], dtype=np.float64),
-                    wrist_rotvec_local=candidate_rotvec,
-                    hand_qpos=np.asarray(best["hand_qpos"], dtype=np.float64),
-                    run_hold_test=False,
-                )
-                if _is_better_projected_candidate(candidate, best, required_contacts):
-                    best = candidate
-                    improved = True
-
-        for joint_idx in range(len(hand_steps)):
-            for direction in (-1.0, 1.0):
-                candidate_hand_qpos = np.asarray(best["hand_qpos"], dtype=np.float64).copy()
-                candidate_hand_qpos[joint_idx] += direction * hand_steps[joint_idx]
-                candidate = _evaluate_projected_candidate(
-                    runtime=runtime,
-                    config=config,
-                    object_pose_goal=object_pose_goal,
-                    source_wrist_pose_world=source_wrist_pose_world,
-                    source_semantic_sites_world=source_semantic_sites_world,
-                    source_contact_mask_12=source_contact_mask_12,
-                    wrist_translation_local=np.asarray(best["wrist_translation_local"], dtype=np.float64),
-                    wrist_rotvec_local=np.asarray(best["wrist_rotvec_local"], dtype=np.float64),
-                    hand_qpos=candidate_hand_qpos,
-                    run_hold_test=False,
-                )
-                if _is_better_projected_candidate(candidate, best, required_contacts):
-                    best = candidate
-                    improved = True
-
-        if not improved:
-            break
-
-    return best
-
-
 def _project_genhand_target(
     runtime: RobotSceneModel,
     config: TaskConfig,
@@ -1957,10 +2368,16 @@ def _project_genhand_target(
     source_semantic_sites_world: np.ndarray,
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
     initial_hand_qpos: np.ndarray,
 ) -> dict[str, Any]:
     base_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
     required_contacts = _required_target_contact_count(source_contact_mask_12)
+    source_contact_targets_obj, source_contact_normals_obj, source_fc_metrics = _human_surface_contact_anchors_obj(
+        config=config,
+        object_pose_goal=object_pose_goal,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
+    )
     seed_states = _box_genhand_seed_states(
         runtime=runtime,
         config=config,
@@ -1969,12 +2386,15 @@ def _project_genhand_target(
         source_semantic_sites_world=source_semantic_sites_world,
         source_keypoints_obj=source_keypoints_obj,
         source_contact_mask_12=source_contact_mask_12,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
         base_hand_qpos=base_hand_qpos,
     )
 
     candidate_pool: list[dict[str, Any]] = []
     global_best: dict[str, Any] | None = None
     for seed_translation, seed_rotvec, seed_hand_qpos in seed_states:
+        candidate: dict[str, Any] | None = None
+        teacher_cost = float("inf")
         try:
             optimized_translation, optimized_rotvec, optimized_hand_qpos, teacher_cost = _optimize_genhand_seed(
                 runtime=runtime,
@@ -1984,41 +2404,51 @@ def _project_genhand_target(
                 source_semantic_sites_world=source_semantic_sites_world,
                 source_keypoints_obj=source_keypoints_obj,
                 source_contact_mask_12=source_contact_mask_12,
+                source_dgrasp_qpos_world=source_dgrasp_qpos_world,
                 initial_translation_local=seed_translation,
                 initial_rotvec_local=seed_rotvec,
                 initial_hand_qpos=seed_hand_qpos,
             )
+            candidate = _evaluate_projected_candidate(
+                runtime=runtime,
+                config=config,
+                object_pose_goal=object_pose_goal,
+                source_wrist_pose_world=source_wrist_pose_world,
+                source_semantic_sites_world=source_semantic_sites_world,
+                source_contact_mask_12=source_contact_mask_12,
+                wrist_translation_local=optimized_translation,
+                wrist_rotvec_local=optimized_rotvec,
+                hand_qpos=optimized_hand_qpos,
+                run_hold_test=False,
+            )
         except Exception:
+            try:
+                candidate = _evaluate_projected_candidate(
+                    runtime=runtime,
+                    config=config,
+                    object_pose_goal=object_pose_goal,
+                    source_wrist_pose_world=source_wrist_pose_world,
+                    source_semantic_sites_world=source_semantic_sites_world,
+                    source_contact_mask_12=source_contact_mask_12,
+                    wrist_translation_local=np.asarray(seed_translation, dtype=np.float64),
+                    wrist_rotvec_local=np.asarray(seed_rotvec, dtype=np.float64),
+                    hand_qpos=np.asarray(seed_hand_qpos, dtype=np.float64),
+                    run_hold_test=False,
+                )
+            except Exception:
+                candidate = None
+        if candidate is None:
             continue
-
-        candidate = _evaluate_projected_candidate(
-            runtime=runtime,
-            config=config,
-            object_pose_goal=object_pose_goal,
-            source_wrist_pose_world=source_wrist_pose_world,
-            source_semantic_sites_world=source_semantic_sites_world,
-            source_contact_mask_12=source_contact_mask_12,
-            wrist_translation_local=optimized_translation,
-            wrist_rotvec_local=optimized_rotvec,
-            hand_qpos=optimized_hand_qpos,
-            run_hold_test=False,
-        )
         candidate["teacher_cost"] = float(teacher_cost)
-        candidate = _coordinate_descent_projected_candidate(
-            runtime=runtime,
-            config=config,
-            object_pose_goal=object_pose_goal,
-            source_wrist_pose_world=source_wrist_pose_world,
-            source_semantic_sites_world=source_semantic_sites_world,
-            source_contact_mask_12=source_contact_mask_12,
-            best=candidate,
-            required_contacts=required_contacts,
-            translation_steps=np.array([0.0015, 0.0015, 0.0020], dtype=np.float64),
-            rotation_steps=np.deg2rad(np.array([1.0, 1.0, 1.5], dtype=np.float64)),
-            hand_steps=np.array([0.04, 0.03, 0.04, 0.04, 0.04, 0.04], dtype=np.float64),
-            passes=2,
+        candidate.update({f"genhand_{k}": float(v) for k, v in source_fc_metrics.items()})
+        candidate.update(
+            _candidate_contact_anchor_metrics(
+                candidate=candidate,
+                object_pose_goal=object_pose_goal,
+                human_contact_targets_obj=source_contact_targets_obj,
+                human_contact_normals_obj=source_contact_normals_obj,
+            )
         )
-        candidate["teacher_cost"] = float(teacher_cost)
         candidate_pool.append(candidate)
         if _is_better_projected_candidate(candidate, global_best, required_contacts):
             global_best = candidate
@@ -2028,7 +2458,7 @@ def _project_genhand_target(
 
     unique_shortlist: list[dict[str, Any]] = []
     seen_keys: set[tuple[float, ...]] = set()
-    for candidate in sorted(candidate_pool, key=lambda item: _projection_rank_key(item, required_contacts)):
+    for candidate in sorted(candidate_pool, key=lambda item: _projection_preshortlist_rank_key(item, required_contacts)):
         key = tuple(
             np.round(
                 np.concatenate(
@@ -2063,6 +2493,9 @@ def _project_genhand_target(
             run_hold_test=True,
         )
         validated["teacher_cost"] = float(candidate.get("teacher_cost", 0.0))
+        for key, value in candidate.items():
+            if isinstance(key, str) and (key.startswith("genhand_") or key.startswith("anchor_")):
+                validated[key] = value
         if _is_better_projected_candidate(validated, hold_validated_best, required_contacts):
             hold_validated_best = validated
 
@@ -2079,225 +2512,6 @@ def _project_genhand_target(
     return hold_validated_best
 
 
-def _project_legacy_feasible_target(
-    runtime: RobotSceneModel,
-    config: TaskConfig,
-    object_pose_goal: np.ndarray,
-    source_wrist_pose_world: np.ndarray,
-    source_semantic_sites_world: np.ndarray,
-    source_keypoints_obj: np.ndarray,
-    source_contact_mask_12: np.ndarray,
-    initial_arm_qpos: np.ndarray,
-    initial_hand_qpos: np.ndarray,
-) -> dict[str, Any]:
-    del initial_arm_qpos
-
-    base_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
-    contact_biased_hand = runtime.clamp_hand(base_hand_qpos + _finger_contact_bias_from_mask(source_contact_mask_12))
-    aggressive_contact_hand = runtime.clamp_hand(base_hand_qpos + 1.45 * _finger_contact_bias_from_mask(source_contact_mask_12))
-    required_contacts = _required_target_contact_count(source_contact_mask_12)
-    generic_seed_states = [
-        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.zeros(3, dtype=np.float64), base_hand_qpos),
-        (np.array([0.0, 0.0, -0.006], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
-        (np.array([0.0, 0.0, -0.003], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
-        (np.array([0.0, 0.0, 0.002], dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
-        (np.array([0.0, 0.0, 0.001], dtype=np.float64), np.deg2rad(np.array([0.0, -4.0, 0.0], dtype=np.float64)), aggressive_contact_hand),
-        (np.array([0.0, 0.0, 0.001], dtype=np.float64), np.deg2rad(np.array([0.0, 4.0, 0.0], dtype=np.float64)), aggressive_contact_hand),
-        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([3.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
-        (np.array([0.0, 0.0, 0.0], dtype=np.float64), np.deg2rad(np.array([-3.0, 0.0, 0.0], dtype=np.float64)), contact_biased_hand),
-    ]
-    cylinder_seed_states = _cylinder_grasp_seed_states(
-        runtime=runtime,
-        config=config,
-        object_pose_goal=object_pose_goal,
-        source_wrist_pose_world=source_wrist_pose_world,
-        source_semantic_sites_world=source_semantic_sites_world,
-        source_contact_mask_12=source_contact_mask_12,
-        base_hand_qpos=base_hand_qpos,
-    )
-    cylinder_absolute_seed_poses = _cylinder_object_frame_seed_poses(
-        runtime=runtime,
-        config=config,
-        object_pose_goal=object_pose_goal,
-        source_keypoints_obj=source_keypoints_obj,
-        source_contact_mask_12=source_contact_mask_12,
-        base_hand_qpos=base_hand_qpos,
-    )
-    seed_states = cylinder_seed_states + generic_seed_states
-
-    contact_direction_seed_specs = [
-        (np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), contact_biased_hand),
-        (np.array([0.0, 0.0, 0.004], dtype=np.float64), np.zeros(3, dtype=np.float64), aggressive_contact_hand),
-    ]
-    if config.object_geom_type == "cylinder":
-        contact_direction_seed_specs.extend(
-            [
-                (np.array([0.0, 0.0, 0.006], dtype=np.float64), np.zeros(3, dtype=np.float64), _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=1.10)),
-                (np.array([0.0, 0.0, 0.008], dtype=np.float64), np.deg2rad(np.array([0.0, 0.0, 10.0], dtype=np.float64)), _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=1.25)),
-                (np.array([0.0, 0.0, 0.008], dtype=np.float64), np.deg2rad(np.array([0.0, 0.0, -10.0], dtype=np.float64)), _cylinder_hand_wrap_seed(runtime, source_contact_mask_12, strength=1.25)),
-            ]
-        )
-    optimized_seed_states: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-    for seed_translation, seed_rotvec, seed_hand_qpos in contact_direction_seed_specs:
-        try:
-            optimized_translation, optimized_rotvec, optimized_hand_qpos, _ = _optimize_contact_direction_seed(
-                runtime=runtime,
-                config=config,
-                object_pose_goal=object_pose_goal,
-                source_wrist_pose_world=source_wrist_pose_world,
-                source_semantic_sites_world=source_semantic_sites_world,
-                source_keypoints_obj=source_keypoints_obj,
-                source_contact_mask_12=source_contact_mask_12,
-                initial_translation_local=seed_translation,
-                initial_rotvec_local=seed_rotvec,
-                initial_hand_qpos=seed_hand_qpos,
-            )
-            optimized_seed_states.append((optimized_translation, optimized_rotvec, optimized_hand_qpos))
-        except Exception:
-            continue
-
-    for seed_wrist_pose_world, seed_hand_qpos in cylinder_absolute_seed_poses:
-        try:
-            optimized_translation_seed, optimized_rotvec_seed, optimized_hand_qpos, _ = _optimize_contact_direction_seed(
-                runtime=runtime,
-                config=config,
-                object_pose_goal=object_pose_goal,
-                source_wrist_pose_world=seed_wrist_pose_world,
-                source_semantic_sites_world=source_semantic_sites_world,
-                source_keypoints_obj=source_keypoints_obj,
-                source_contact_mask_12=source_contact_mask_12,
-                initial_translation_local=np.zeros(3, dtype=np.float64),
-                initial_rotvec_local=np.zeros(3, dtype=np.float64),
-                initial_hand_qpos=seed_hand_qpos,
-            )
-            optimized_wrist_pose_world = apply_local_pose_delta(
-                seed_wrist_pose_world,
-                optimized_translation_seed,
-                optimized_rotvec_seed,
-            )
-            optimized_translation, optimized_rotvec = _pose_delta_local(
-                source_wrist_pose_world,
-                optimized_wrist_pose_world,
-            )
-            optimized_seed_states.append((optimized_translation, optimized_rotvec, optimized_hand_qpos))
-        except Exception:
-            continue
-
-    if config.object_geom_type == "cylinder":
-        # For cylindrical grasps, prioritize object-frame contact/direction solutions and
-        # only keep a very small amount of generic fallback exploration.
-        seed_states = optimized_seed_states + cylinder_seed_states + generic_seed_states[:2]
-    else:
-        seed_states = optimized_seed_states + seed_states
-
-    translation_step_schedule = [
-        np.array([0.004, 0.004, 0.006], dtype=np.float64),
-        np.array([0.0015, 0.0015, 0.0025], dtype=np.float64),
-    ]
-    rotation_step_schedule = [
-        np.deg2rad(np.array([4.0, 4.0, 6.0], dtype=np.float64)),
-        np.deg2rad(np.array([1.5, 1.5, 2.5], dtype=np.float64)),
-    ]
-    hand_step_schedule = [
-        np.array([0.14, 0.10, 0.14, 0.14, 0.14, 0.14], dtype=np.float64),
-        np.array([0.05, 0.035, 0.05, 0.05, 0.05, 0.05], dtype=np.float64),
-    ] 
-
-    global_best: dict[str, Any] | None = None
-    shortlist: list[dict[str, Any]] = []
-
-    for seed_translation, seed_rotvec, seed_hand_qpos in seed_states:
-        best = _evaluate_projected_candidate(
-            runtime=runtime,
-            config=config,
-            object_pose_goal=object_pose_goal,
-            source_wrist_pose_world=source_wrist_pose_world,
-            source_semantic_sites_world=source_semantic_sites_world,
-            source_contact_mask_12=source_contact_mask_12,
-            wrist_translation_local=seed_translation,
-            wrist_rotvec_local=seed_rotvec,
-            hand_qpos=seed_hand_qpos,
-            run_hold_test=False,
-        )
-
-        for translation_steps, rotation_steps, hand_steps in zip(
-            translation_step_schedule,
-            rotation_step_schedule,
-            hand_step_schedule,
-        ):
-            best = _coordinate_descent_projected_candidate(
-                runtime=runtime,
-                config=config,
-                object_pose_goal=object_pose_goal,
-                source_wrist_pose_world=source_wrist_pose_world,
-                source_semantic_sites_world=source_semantic_sites_world,
-                source_contact_mask_12=source_contact_mask_12,
-                best=best,
-                required_contacts=required_contacts,
-                translation_steps=translation_steps,
-                rotation_steps=rotation_steps,
-                hand_steps=hand_steps,
-                passes=3,
-            )
-
-        if _is_better_projected_candidate(best, global_best, required_contacts):
-            global_best = best
-        shortlist.append(best)
-
-    if global_best is None:
-        raise RuntimeError("Failed to project a feasible pose-driven target.")
-
-    shortlist.append(global_best)
-    unique_shortlist: list[dict[str, Any]] = []
-    seen_keys: set[tuple[float, ...]] = set()
-    for candidate in sorted(shortlist, key=lambda item: _projection_rank_key(item, required_contacts)):
-        key = tuple(
-            np.round(
-                np.concatenate(
-                    [
-                        np.asarray(candidate["wrist_translation_local"], dtype=np.float64),
-                        np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64),
-                        np.asarray(candidate["hand_qpos"], dtype=np.float64),
-                    ]
-                ),
-                5,
-            ).tolist()
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_shortlist.append(candidate)
-        shortlist_limit = 10 if config.object_geom_type == "cylinder" else 6
-        if len(unique_shortlist) >= shortlist_limit:
-            break
-
-    hold_validated_best: dict[str, Any] | None = None
-    for candidate in unique_shortlist:
-        validated = _evaluate_projected_candidate(
-            runtime=runtime,
-            config=config,
-            object_pose_goal=object_pose_goal,
-            source_wrist_pose_world=source_wrist_pose_world,
-            source_semantic_sites_world=source_semantic_sites_world,
-            source_contact_mask_12=source_contact_mask_12,
-            wrist_translation_local=np.asarray(candidate["wrist_translation_local"], dtype=np.float64),
-            wrist_rotvec_local=np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64),
-            hand_qpos=np.asarray(candidate["hand_qpos"], dtype=np.float64),
-            run_hold_test=True,
-        )
-        if _is_better_projected_candidate(validated, hold_validated_best, required_contacts):
-            hold_validated_best = validated
-
-    if hold_validated_best is None:
-        raise RuntimeError("Failed to validate any projected candidate with hold-test.")
-
-    hold_validated_best["retreat_m"] = float(max(0.0, -float(np.asarray(hold_validated_best["wrist_translation_local"])[2])))
-    hold_validated_best["hand_open_blend"] = float(
-        np.linalg.norm(np.asarray(hold_validated_best["hand_qpos"]) - base_hand_qpos) / max(np.linalg.norm(runtime.hand_upper - runtime.hand_lower), 1e-8)
-    )
-    return hold_validated_best
-
-
 def _project_feasible_target(
     runtime: RobotSceneModel,
     config: TaskConfig,
@@ -2306,6 +2520,7 @@ def _project_feasible_target(
     source_semantic_sites_world: np.ndarray,
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
+    source_dgrasp_qpos_world: np.ndarray | None,
     initial_arm_qpos: np.ndarray,
     initial_hand_qpos: np.ndarray,
 ) -> dict[str, Any]:
@@ -2318,6 +2533,7 @@ def _project_feasible_target(
         source_semantic_sites_world=source_semantic_sites_world,
         source_keypoints_obj=source_keypoints_obj,
         source_contact_mask_12=source_contact_mask_12,
+        source_dgrasp_qpos_world=source_dgrasp_qpos_world,
         initial_hand_qpos=initial_hand_qpos,
     )
     projected["retarget_method"] = "genhand_direct"
@@ -2363,6 +2579,8 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
         source_wrist_pose_goal_world = wrist_pose_from_semantic_sites(source_semantic_sites_world)
         source_root_pose_world = _source_root_pose_world(final_qpos[label_idx], final_pose[label_idx], workspace_translation)
         source_contact_mask = contact_mask_16_to_12(final_contacts[label_idx])
+        source_dgrasp_qpos_world = final_qpos[label_idx].copy()
+        source_dgrasp_qpos_world[:3] += workspace_translation
         reachability_delta = _compute_reachability_alignment_delta(
             config=config,
             goal_pose=goal_pose,
@@ -2374,6 +2592,7 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
         source_semantic_sites_world = source_semantic_sites_world + reachability_delta[None, :]
         source_wrist_pose_goal_world[:3] += reachability_delta
         source_root_pose_world[:3] += reachability_delta
+        source_dgrasp_qpos_world[:3] += reachability_delta
 
         arm_qpos = solve_arm_wrist_palm_ik(
             runtime=runtime,
@@ -2399,6 +2618,7 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             source_semantic_sites_world=source_semantic_sites_world,
             source_keypoints_obj=final_ee_rel[label_idx],
             source_contact_mask_12=source_contact_mask,
+            source_dgrasp_qpos_world=source_dgrasp_qpos_world,
             initial_arm_qpos=arm_qpos,
             initial_hand_qpos=hand_qpos,
         )
@@ -2407,16 +2627,21 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
         projected_object_pose_goal = np.asarray(projected["object_pose_goal"], dtype=np.float64)
         projected_semantic_sites_object = transform_points(projected_semantic_sites_world, inverse_pose7(projected_object_pose_goal))
         projected_wrist_pose_object = compose_pose7(inverse_pose7(projected_object_pose_goal), projected_wrist_pose_world)
-        projected_contact_points_object = transform_points(
-            np.asarray(projected["contact_candidate_points_world"], dtype=np.float64),
+        projected_contact_point_sets_object = transform_points(
+            np.asarray(projected["contact_candidate_point_sets_world"], dtype=np.float64).reshape(-1, 3),
             inverse_pose7(projected_object_pose_goal),
+        ).reshape(np.asarray(projected["contact_candidate_point_sets_world"], dtype=np.float64).shape)
+        projected_contact_normal_sets_object = np.einsum(
+            "ij,ksj->ksi",
+            quat_wxyz_to_matrix(inverse_pose7(projected_object_pose_goal)[3:]),
+            np.asarray(projected["contact_candidate_normal_sets_world"], dtype=np.float64),
         )
         anchor_metrics = _contact_anchor_metrics_obj(
-            robot_contact_points_obj=projected_contact_points_object,
-            robot_contact_family_indices=np.asarray(projected["contact_candidate_family_indices"], dtype=np.int64),
-            source_keypoints_obj=final_ee_rel[label_idx],
-            source_contact_mask_12=source_contact_mask,
+            robot_contact_point_sets_obj=projected_contact_point_sets_object,
+            robot_contact_normal_sets_obj=projected_contact_normal_sets_object,
             config=config,
+            object_pose_goal=projected_object_pose_goal,
+            source_dgrasp_qpos_world=source_dgrasp_qpos_world,
         )
         fit_error = {
             "wrist_error_m": 0.0,
@@ -2467,8 +2692,17 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "projected_anchor_rmse_m": float(anchor_metrics["anchor_rmse_m"]),
             "projected_anchor_max_error_m": float(anchor_metrics["anchor_max_error_m"]),
             "projected_anchor_pairs": float(anchor_metrics["anchor_pairs"]),
+            "projected_anchor_assignment_norm_cost": float(anchor_metrics.get("anchor_assignment_norm_cost", 0.0)),
+            "projected_anchor_assignment_method": float(anchor_metrics.get("anchor_assignment_method", 0.0)),
+            "genhand_fc_loss": float(anchor_metrics.get("genhand_fc_loss", projected.get("genhand_fc_loss", 0.0))),
+            "genhand_fc_net_wrench": float(anchor_metrics.get("genhand_fc_net_wrench", projected.get("genhand_fc_net_wrench", 0.0))),
+            "genhand_fc_lin_ind": float(anchor_metrics.get("genhand_fc_lin_ind", projected.get("genhand_fc_lin_ind", 0.0))),
+            "genhand_fc_intfc": float(anchor_metrics.get("genhand_fc_intfc", projected.get("genhand_fc_intfc", 0.0))),
+            "genhand_cluster_candidate_count": float(anchor_metrics.get("genhand_cluster_candidate_count", projected.get("genhand_cluster_candidate_count", 0.0))),
+            "genhand_cluster_score_mean": float(anchor_metrics.get("genhand_cluster_score_mean", projected.get("genhand_cluster_score_mean", 0.0))),
+            "genhand_target_anchor_rmse_m": float(anchor_metrics.get("genhand_target_anchor_rmse_m", projected.get("genhand_target_anchor_rmse_m", 0.0))),
             "projection_score": float(projected["score"]),
-            "retarget_method": 1.0 if str(projected.get("retarget_method", "genhand_direct")).startswith("genhand") else 0.0,
+            "retarget_method": str(projected.get("retarget_method", "genhand_direct")),
             "teacher_cost": float(projected.get("teacher_cost", 0.0)),
             "optimizer_cost": optimizer_cost,
         }
@@ -2491,7 +2725,6 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             and fit_error["projected_hold_hybrid_contact_group_count"] >= 2.0
             and fit_error["projected_hold_hard_contact_group_count"] >= 1.0
             and bool(projected["hold_has_thumb_opposition"])
-            and fit_error["projected_hold_matched_target_contacts"] >= fit_error["projected_required_target_contacts"]
             and fit_error["projected_contact_group_count"] >= 2.0
             and fit_error["projected_hard_contact_group_count"] >= 1.0
             and bool(projected["settled_has_thumb_opposition"])
@@ -2559,6 +2792,8 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
                 "projected_anchor_rmse_m": float(anchor_metrics["anchor_rmse_m"]),
                 "projected_anchor_max_error_m": float(anchor_metrics["anchor_max_error_m"]),
                 "projected_anchor_pairs": float(anchor_metrics["anchor_pairs"]),
+                "projected_anchor_assignment_norm_cost": float(anchor_metrics.get("anchor_assignment_norm_cost", 0.0)),
+                "projected_anchor_assignment_method": float(anchor_metrics.get("anchor_assignment_method", 0.0)),
                 "retarget_method": str(projected.get("retarget_method", "genhand_direct")),
                 **fit_error,
             }

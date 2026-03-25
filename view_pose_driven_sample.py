@@ -163,16 +163,28 @@ def print_sample_summary(sample_index: int, sample: PoseDrivenSample, samples_pa
     print(f"Sample index: {sample_index}")
     print(f"Label idx: {sample.label_idx}")
     print(f"Execution valid: {sample.valid_execution}")
-    method_flag = fit.get("retarget_method", 0.0)
-    method_name = "genhand_direct" if float(method_flag) >= 0.5 else "legacy_projection"
+    method_flag = fit.get("retarget_method", "genhand_direct")
+    if isinstance(method_flag, str):
+        method_name = method_flag
+    else:
+        method_name = "genhand_direct" if float(method_flag) >= 0.5 else "legacy_projection"
     print(f"Retarget method: {method_name}")
     print(
         "Projection stats: "
         f"source_tip_rmse={fit.get('source_tip_rmse_m', fit.get('tip_rmse_m', 0.0)):.4f} m, "
         f"anchor_rmse={fit.get('projected_anchor_rmse_m', 0.0):.4f} m, "
+        f"assign_cost={fit.get('projected_anchor_assignment_norm_cost', 0.0):.4f}, "
         f"max_penetration={fit.get('projected_max_penetration_m', 0.0):.4f} m, "
         f"contact_hamming={fit.get('source_contact_hamming', 0.0):.0f}, "
         f"retreat={fit.get('projected_retreat_m', 0.0):.4f} m"
+    )
+    print(
+        "GenHand stats: "
+        f"target_anchor_rmse={fit.get('genhand_target_anchor_rmse_m', 0.0):.4f} m, "
+        f"cluster_score={fit.get('genhand_cluster_score_mean', 0.0):.4f}, "
+        f"fc_loss={fit.get('genhand_fc_loss', 0.0):.4f}, "
+        f"fc_wrench={fit.get('genhand_fc_net_wrench', 0.0):.4f}, "
+        f"teacher_cost={fit.get('teacher_cost', 0.0):.4f}"
     )
     print(
         "Hold stats: "
