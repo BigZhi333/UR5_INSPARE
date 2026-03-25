@@ -14,9 +14,17 @@ import numpy as np
 import torch
 from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.spatial.transform import Rotation
+try:
+    import pytorch_volumetric as pv
+except Exception:  # pragma: no cover - optional runtime backend
+    pv = None
+try:
+    import trimesh as tm
+except Exception:  # pragma: no cover - optional runtime backend
+    tm = None
 
 from .kinematics import solve_arm_wrist_palm_ik
-from .paths import BUNDLED_DGRASP_DIR, PROJECT_DIR, WORKSPACE_DIR, ensure_runtime_dirs
+from .paths import BUNDLED_DGRASP_DIR, PROJECT_DIR, WORKSPACE_DIR, ensure_runtime_dirs, locate_dgrasp_root
 from .robot_model import RobotSceneModel
 from .scene_builder import build_training_scene
 from .semantics import (
@@ -83,12 +91,13 @@ GENHAND_ANTIPODAL_MIN_COS = 0.18
 GENHAND_PACKED_MAX_PER_FINGER = 16
 GENHAND_PACKED_FALLBACK_PER_FINGER = 8
 GENHAND_FRICTION_COEFF = 0.7
+GENHAND_FC_MU = 0.9
 GENHAND_FORCE_CLOSURE_SIGMA_WEIGHT = 0.10
 GENHAND_FORCE_CLOSURE_SPREAD_WEIGHT = 0.05
 GENHAND_HDBSCAN_NORMAL_MIN_CLUSTER = 10
 GENHAND_HDBSCAN_POSITION_MIN_CLUSTER = 4
-GENHAND_FC_MAX_ITERS = 120
-GENHAND_GF_MAX_ITERS = 60
+GENHAND_FC_MAX_ITERS = 2000
+GENHAND_GF_MAX_ITERS = 1
 GENHAND_FC_LR = 1.0e-3
 GENHAND_GF_LR = 5.0e-3
 GENHAND_CONTACT_TARGET_TOL_M = 0.010
@@ -113,6 +122,13 @@ GENHAND_MANO_CONTACT_ZONES = {
     "little": [690, 689, 667, 695, 670, 694, 664, 683, 688, 665, 693, 691, 666, 687, 661, 663],
     "thumb": [743, 738, 768, 740, 763, 737, 766, 767, 764, 734, 735, 762, 745, 761, 717, 765],
 }
+
+
+@dataclass(frozen=True)
+class _MeshSurfaceQueryBackend:
+    mesh_path: str
+    mesh: Any
+    mesh_sdf: Any
 @dataclass
 class PoseDrivenSample:
     object_id: int
@@ -903,6 +919,70 @@ def _human_finger_directions_obj(source_keypoints_obj: np.ndarray) -> np.ndarray
     return np.asarray(directions, dtype=np.float64)
 
 
+def _resolve_object_surface_mesh_path(config: TaskConfig) -> Path | None:
+    build_mesh = config.project_dir / "build" / f"{config.object_name}_visual.obj"
+    if not build_mesh.exists():
+        try:
+            build_training_scene(config, force_rebuild=False)
+        except Exception:
+            pass
+    if build_mesh.exists():
+        return build_mesh.resolve()
+    source_mesh = locate_dgrasp_root() / "rsc" / "meshes_simplified" / config.object_name / "textured_meshlab.obj"
+    if source_mesh.exists():
+        return source_mesh.resolve()
+    return None
+
+
+@lru_cache(maxsize=16)
+def _load_object_mesh_surface_backend(mesh_path_text: str) -> _MeshSurfaceQueryBackend | None:
+    if pv is None or tm is None:
+        return None
+    mesh_path = Path(mesh_path_text)
+    if not mesh_path.exists():
+        return None
+    mesh = tm.load_mesh(mesh_path, process=False)
+    if isinstance(mesh, tm.Scene):
+        geometries = list(mesh.geometry.values())
+        if not geometries:
+            return None
+        mesh = tm.util.concatenate(tuple(geometries))
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    mesh_sdf = pv.MeshSDF(
+        pv.MeshObjectFactory(
+            mesh_name=None,
+            preload_mesh={
+                "vertices": vertices,
+                "faces": faces,
+            },
+        )
+    )
+    return _MeshSurfaceQueryBackend(
+        mesh_path=str(mesh_path),
+        mesh=mesh,
+        mesh_sdf=mesh_sdf,
+    )
+
+
+def _get_object_mesh_surface_backend(config: TaskConfig) -> _MeshSurfaceQueryBackend | None:
+    mesh_path = _resolve_object_surface_mesh_path(config)
+    if mesh_path is None:
+        return None
+    try:
+        return _load_object_mesh_surface_backend(str(mesh_path))
+    except Exception:
+        return None
+
+
+def _object_surface_backend_name(config: TaskConfig) -> str:
+    return "mesh_sdf" if _get_object_mesh_surface_backend(config) is not None else f"analytic_{config.object_geom_type}"
+
+
+def _genhand_lr_schedule(initial_lr: float, step_index: int, interval: int = 1000, factor: float = 0.6) -> float:
+    return float(initial_lr * (factor ** (step_index // interval)))
+
+
 def _project_point_to_box_surface(point_obj: np.ndarray, dims_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     half_extents = 0.5 * np.asarray(dims_m, dtype=np.float64)
     point_obj = np.asarray(point_obj, dtype=np.float64).reshape(3)
@@ -973,6 +1053,15 @@ def _project_targets_to_object_surface(
     target_points_obj: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     target_points_obj = np.asarray(target_points_obj, dtype=np.float64).reshape(-1, 3)
+    mesh_backend = _get_object_mesh_surface_backend(config)
+    if mesh_backend is not None and tm is not None:
+        try:
+            closest_points, _distance, face_index = tm.proximity.closest_point(mesh_backend.mesh, target_points_obj)
+            projected_normals = np.asarray(mesh_backend.mesh.face_normals[np.asarray(face_index, dtype=np.int64)], dtype=np.float64)
+            projected_normals = np.asarray([normalize(normal) for normal in projected_normals], dtype=np.float64)
+            return np.asarray(closest_points, dtype=np.float64), projected_normals
+        except Exception:
+            pass
     projected_points = np.zeros_like(target_points_obj)
     projected_normals = np.zeros_like(target_points_obj)
     for idx, point in enumerate(target_points_obj):
@@ -1079,6 +1168,13 @@ def _object_surface_query_torch(
     points = points_obj
     if points.dim() == 2:
         points = points.unsqueeze(0)
+    mesh_backend = _get_object_mesh_surface_backend(config)
+    if mesh_backend is not None:
+        query_points = points.reshape(-1, 3).to(dtype=torch.float32)
+        sdf, normals = mesh_backend.mesh_sdf(query_points)
+        sdf = sdf.reshape(points.shape[:-1])
+        normals = normals.reshape(points.shape)
+        return sdf, normals
     if config.object_geom_type == "box":
         half = torch.tensor(np.asarray(config.object_dims_m, dtype=np.float32) * 0.5, dtype=torch.float32, device=points.device)
         abs_points = torch.abs(points)
@@ -1285,6 +1381,7 @@ def _optimize_force_closure_targets_obj(
             "fc_distance": 0.0,
             "fc_inter_dist": 0.0,
         }
+    fc_loss.mu = torch.tensor(GENHAND_FC_MU, dtype=torch.float32).to(fc_loss.device)
 
     x = torch.tensor(initial_targets, dtype=torch.float32).unsqueeze(0).requires_grad_(True)
     w = (torch.ones((1, initial_targets.shape[0], 4), dtype=torch.float32) * 0.25).requires_grad_(True)
@@ -1316,7 +1413,10 @@ def _optimize_force_closure_targets_obj(
     opt_fc = torch.optim.Adam([x, w], lr=GENHAND_FC_LR)
     best = None
     best_loss = float("inf")
-    for _ in range(GENHAND_FC_MAX_ITERS):
+    for fc_iter in range(GENHAND_FC_MAX_ITERS):
+        fc_lr = _genhand_lr_schedule(GENHAND_FC_LR, fc_iter)
+        for group in opt_fc.param_groups:
+            group["lr"] = fc_lr
         opt_fc.zero_grad()
         data = fc_terms(x, w)
         data["loss"].backward()
@@ -1341,7 +1441,10 @@ def _optimize_force_closure_targets_obj(
         x = best[0].requires_grad_(False)
         w = best[1].requires_grad_(True)
     opt_gf = torch.optim.Adam([w], lr=GENHAND_GF_LR)
-    for _ in range(GENHAND_GF_MAX_ITERS):
+    for gf_iter in range(GENHAND_GF_MAX_ITERS):
+        gf_lr = _genhand_lr_schedule(GENHAND_GF_LR, gf_iter)
+        for group in opt_gf.param_groups:
+            group["lr"] = gf_lr
         opt_gf.zero_grad()
         data = fc_terms(x, w)
         gf_loss = data["net_wrench"] + data["lin_ind"] + data["int_fc"]
@@ -1360,6 +1463,7 @@ def _optimize_force_closure_targets_obj(
         "fc_intfc": float(final_terms["int_fc"].detach().cpu().item()),
         "fc_distance": float(final_terms["distance"].detach().cpu().item()),
         "fc_inter_dist": float(final_terms["inter_dist"].detach().cpu().item()),
+        "fc_mu": float(GENHAND_FC_MU),
     }
     return projected_points, projected_normals, metrics
 
@@ -1778,7 +1882,6 @@ def _optimize_genhand_seed(
         runtime.reset()
         runtime.set_object_pose(object_pose_goal)
         runtime.set_robot_actuated_qpos(np.concatenate([arm_qpos, hand_qpos]))
-
         contact_candidate_point_sets_world, contact_candidate_normal_sets_world, _contact_candidate_families = runtime.get_contact_candidate_point_sets_world()
         contact_candidate_point_sets_obj = transform_points(
             contact_candidate_point_sets_world.reshape(-1, 3),
@@ -2160,7 +2263,6 @@ def _evaluate_projected_candidate(
         damping=config.conversion.arm_ik_damping,
     )
     target_actuated_qpos = np.concatenate([candidate_arm_qpos, candidate_hand_qpos])
-
     runtime.reset()
     runtime.set_object_pose(object_pose_goal)
     runtime.settle_actuated_pose(target_actuated_qpos, PROJECTION_SETTLE_STEPS)
@@ -2394,7 +2496,8 @@ def _project_genhand_target(
     global_best: dict[str, Any] | None = None
     for seed_translation, seed_rotvec, seed_hand_qpos in seed_states:
         candidate: dict[str, Any] | None = None
-        teacher_cost = float("inf")
+        teacher_cost = 1.0e6
+        teacher_failed = 0.0
         try:
             optimized_translation, optimized_rotvec, optimized_hand_qpos, teacher_cost = _optimize_genhand_seed(
                 runtime=runtime,
@@ -2422,6 +2525,7 @@ def _project_genhand_target(
                 run_hold_test=False,
             )
         except Exception:
+            teacher_failed = 1.0
             try:
                 candidate = _evaluate_projected_candidate(
                     runtime=runtime,
@@ -2440,6 +2544,7 @@ def _project_genhand_target(
         if candidate is None:
             continue
         candidate["teacher_cost"] = float(teacher_cost)
+        candidate["genhand_opt_failed"] = float(teacher_failed)
         candidate.update({f"genhand_{k}": float(v) for k, v in source_fc_metrics.items()})
         candidate.update(
             _candidate_contact_anchor_metrics(
@@ -2493,6 +2598,7 @@ def _project_genhand_target(
             run_hold_test=True,
         )
         validated["teacher_cost"] = float(candidate.get("teacher_cost", 0.0))
+        validated["genhand_opt_failed"] = float(candidate.get("genhand_opt_failed", 0.0))
         for key, value in candidate.items():
             if isinstance(key, str) and (key.startswith("genhand_") or key.startswith("anchor_")):
                 validated[key] = value
@@ -2698,11 +2804,13 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "genhand_fc_net_wrench": float(anchor_metrics.get("genhand_fc_net_wrench", projected.get("genhand_fc_net_wrench", 0.0))),
             "genhand_fc_lin_ind": float(anchor_metrics.get("genhand_fc_lin_ind", projected.get("genhand_fc_lin_ind", 0.0))),
             "genhand_fc_intfc": float(anchor_metrics.get("genhand_fc_intfc", projected.get("genhand_fc_intfc", 0.0))),
+            "genhand_fc_mu": float(anchor_metrics.get("genhand_fc_mu", projected.get("genhand_fc_mu", GENHAND_FC_MU))),
             "genhand_cluster_candidate_count": float(anchor_metrics.get("genhand_cluster_candidate_count", projected.get("genhand_cluster_candidate_count", 0.0))),
             "genhand_cluster_score_mean": float(anchor_metrics.get("genhand_cluster_score_mean", projected.get("genhand_cluster_score_mean", 0.0))),
             "genhand_target_anchor_rmse_m": float(anchor_metrics.get("genhand_target_anchor_rmse_m", projected.get("genhand_target_anchor_rmse_m", 0.0))),
             "projection_score": float(projected["score"]),
             "retarget_method": str(projected.get("retarget_method", "genhand_direct")),
+            "surface_query_backend": _object_surface_backend_name(config),
             "teacher_cost": float(projected.get("teacher_cost", 0.0)),
             "optimizer_cost": optimizer_cost,
         }
