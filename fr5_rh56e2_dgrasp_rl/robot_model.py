@@ -195,11 +195,25 @@ class RobotSceneModel:
         self.set_table_height(self.original_table_center_z)
         mujoco.mj_forward(self.model, self.data)
 
-    def set_arm_hold_mode(self, enabled: bool, arm_kp_scale: float = 1.0) -> None:
-        scale = float(arm_kp_scale if enabled else 1.0)
+    def set_arm_hold_mode(
+        self,
+        enabled: bool,
+        arm_kp_scale: float = 1.0,
+        hand_kp_scale: float = 1.0,
+    ) -> None:
+        arm_scale = float(arm_kp_scale if enabled else 1.0)
+        hand_scale = float(hand_kp_scale if enabled else 1.0)
         arm_count = len(self.arm_joints)
-        self.model.actuator_gainprm[:arm_count, 0] = self.default_actuator_kp[:arm_count] * scale
-        self.model.actuator_biasprm[:arm_count, 1] = -self.default_actuator_kp[:arm_count] * scale
+        total_count = len(self.actuated_joints)
+        self.model.actuator_gainprm[:arm_count, 0] = self.default_actuator_kp[:arm_count] * arm_scale
+        self.model.actuator_biasprm[:arm_count, 1] = -self.default_actuator_kp[:arm_count] * arm_scale
+        if total_count > arm_count:
+            self.model.actuator_gainprm[arm_count:total_count, 0] = (
+                self.default_actuator_kp[arm_count:total_count] * hand_scale
+            )
+            self.model.actuator_biasprm[arm_count:total_count, 1] = (
+                -self.default_actuator_kp[arm_count:total_count] * hand_scale
+            )
 
     def _arm_support_torque(self, force_world: np.ndarray) -> np.ndarray:
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
@@ -267,6 +281,16 @@ class RobotSceneModel:
         for joint_name, value in resolved.items():
             self.data.qpos[self.qpos_index_by_joint[joint_name]] = value
         self.data.qvel[:] = 0.0
+        if update_ctrl:
+            self.data.ctrl[:] = actuated_qpos
+        mujoco.mj_forward(self.model, self.data)
+
+    def set_robot_actuated_qpos_kinematic(self, actuated_qpos: np.ndarray, update_ctrl: bool = True) -> None:
+        actuated_qpos = self.clamp_actuated(np.asarray(actuated_qpos, dtype=np.float64))
+        resolved = self.actuated_to_full_joint_map(actuated_qpos)
+        for joint_name, value in resolved.items():
+            self.data.qpos[self.qpos_index_by_joint[joint_name]] = value
+            self.data.qvel[self.qvel_index_by_joint[joint_name]] = 0.0
         if update_ctrl:
             self.data.ctrl[:] = actuated_qpos
         mujoco.mj_forward(self.model, self.data)

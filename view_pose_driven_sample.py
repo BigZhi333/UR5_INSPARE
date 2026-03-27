@@ -11,6 +11,9 @@ import numpy as np
 from fr5_rh56e2_dgrasp_rl.kinematics import solve_arm_wrist_palm_ik
 from fr5_rh56e2_dgrasp_rl.paths import configure_local_runtime_env
 from fr5_rh56e2_dgrasp_rl.pose_driven_data import (
+    PROJECTION_HOLD_ARM_KP_SCALE,
+    PROJECTION_HOLD_PRELOAD_STEPS,
+    PROJECTION_HOLD_SUPPORT_FORCE_SCALE,
     PROJECTION_SETTLE_STEPS,
     PoseDrivenSample,
     load_pose_driven_samples,
@@ -23,6 +26,9 @@ from fr5_rh56e2_dgrasp_rl.scene_builder import build_training_scene
 from fr5_rh56e2_dgrasp_rl.semantics import SEMANTIC_CONTACT_NAMES
 from fr5_rh56e2_dgrasp_rl.task_config import TaskConfig
 from fr5_rh56e2_dgrasp_rl.utils import normalize
+
+VIEWER_DEFAULT_HOLD_ARM_KP_SCALE = max(4.0, PROJECTION_HOLD_ARM_KP_SCALE)
+VIEWER_DEFAULT_HOLD_HAND_KP_SCALE = 2.5
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -47,6 +53,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pause-steps", type=int, default=30)
     parser.add_argument("--sim-substeps", type=int, default=4)
     parser.add_argument("--kinematic", action="store_true")
+    parser.add_argument("--physics-approach", action="store_true")
+    parser.add_argument("--hold-arm-kp-scale", type=float, default=VIEWER_DEFAULT_HOLD_ARM_KP_SCALE)
+    parser.add_argument("--hold-hand-kp-scale", type=float, default=VIEWER_DEFAULT_HOLD_HAND_KP_SCALE)
+    parser.add_argument("--hold-support-scale", type=float, default=PROJECTION_HOLD_SUPPORT_FORCE_SCALE)
     return parser
 
 
@@ -118,6 +128,23 @@ def select_sample(samples: list[PoseDrivenSample], args: argparse.Namespace) -> 
             sample = samples[idx]
             fit = sample.fit_error
             num_contacts = float(sum(value > 0.5 for value in sample.contact_mask_12))
+            hold_tested = bool(fit.get("projected_hold_tested", True))
+            if not hold_tested:
+                return (
+                    float(not sample.valid_execution),
+                    -float(fit.get("projected_contact_group_count", 0.0)),
+                    -float(fit.get("projected_hard_contact_group_count", 0.0)),
+                    -float(fit.get("projected_has_thumb_opposition", 0.0)),
+                    float(fit.get("projected_anchor_rmse_m", 999.0)),
+                    float(fit.get("projected_max_penetration_m", 999.0)),
+                    -float(fit.get("projected_matched_target_contacts", 0.0)),
+                    float(fit.get("source_tip_rmse_m", fit.get("tip_rmse_m", 999.0))),
+                    float(fit.get("projected_reach_base_facing_cos", 999.0)),
+                    float(-fit.get("projected_reach_object_facing_cos", -999.0)),
+                    float(-(num_contacts > 0.0)),
+                    -num_contacts,
+                    -float(sample.object_pose_goal[2]),
+                )
             return (
                 float(not sample.valid_execution),
                 -float(fit.get("projected_hold_hybrid_contact_group_count", 0.0)),
@@ -188,10 +215,17 @@ def print_sample_summary(sample_index: int, sample: PoseDrivenSample, samples_pa
     )
     print(
         "Hold stats: "
-        f"drop={fit.get('projected_hold_object_drop_m', 0.0):.4f} m, "
-        f"groups(hybrid/hard)={fit.get('projected_hold_hybrid_contact_group_count', 0.0):.1f}/"
-        f"{fit.get('projected_hold_hard_contact_group_count', 0.0):.1f}, "
-        f"thumb_opposition={int(round(fit.get('projected_hold_has_thumb_opposition', 0.0)))}"
+        + (
+            "disabled"
+            if not bool(fit.get("projected_hold_tested", True))
+            else
+            (
+                f"drop={fit.get('projected_hold_object_drop_m', 0.0):.4f} m, "
+                f"groups(hybrid/hard)={fit.get('projected_hold_hybrid_contact_group_count', 0.0):.1f}/"
+                f"{fit.get('projected_hold_hard_contact_group_count', 0.0):.1f}, "
+                f"thumb_opposition={int(round(fit.get('projected_hold_has_thumb_opposition', 0.0)))}"
+            )
+        )
     )
     if "projected_cylinder_palm_clearance_error_m" in fit:
         print(
@@ -254,10 +288,57 @@ def set_final_target_pose(runtime: RobotSceneModel, config: TaskConfig, sample: 
     runtime.reset()
     runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
     arm_qpos = solve_final_arm_qpos(runtime, config, sample)
-    runtime.settle_actuated_pose(
+    runtime.set_robot_actuated_qpos(
         np.concatenate([arm_qpos, np.asarray(sample.hand_qpos_6, dtype=np.float64)]),
-        PROJECTION_SETTLE_STEPS,
+        update_ctrl=True,
     )
+
+
+def _zero_runtime_velocities(runtime: RobotSceneModel) -> None:
+    runtime.data.qvel[:] = 0.0
+    runtime.data.qfrc_applied[:] = 0.0
+    if hasattr(runtime.data, "qacc_warmstart"):
+        runtime.data.qacc_warmstart[:] = 0.0
+    mujoco.mj_forward(runtime.model, runtime.data)
+
+
+def _run_hold_validation_preview(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    final_ctrl: np.ndarray,
+    hold_steps: int,
+    sim_substeps: int,
+    arm_kp_scale: float,
+    hand_kp_scale: float,
+    support_scale: float,
+    viewer: mujoco_viewer.Handle,
+) -> None:
+    final_ctrl = runtime.clamp_actuated(np.asarray(final_ctrl, dtype=np.float64))
+    runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+    _zero_runtime_velocities(runtime)
+    runtime.set_arm_hold_mode(True, arm_kp_scale=arm_kp_scale, hand_kp_scale=hand_kp_scale)
+    support_force_world = np.array(
+        [0.0, 0.0, float(config.object_mass_kg) * float(support_scale)],
+        dtype=np.float64,
+    )
+    preload_steps = max(PROJECTION_HOLD_PRELOAD_STEPS, 1)
+    try:
+        for _ in range(preload_steps):
+            runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+            runtime.step(final_ctrl, max(1, sim_substeps), arm_support_force_world=support_force_world)
+            runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+            viewer.sync()
+            time.sleep(1.0 / 60.0)
+        runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+        runtime.set_table_height(0.0)
+        for _ in range(max(1, hold_steps)):
+            runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+            runtime.step(final_ctrl, max(1, sim_substeps), arm_support_force_world=support_force_world)
+            runtime.set_robot_actuated_qpos_kinematic(final_ctrl, update_ctrl=True)
+            viewer.sync()
+            time.sleep(1.0 / 60.0)
+    finally:
+        runtime.set_arm_hold_mode(False)
 
 
 def play_sample_kinematic(
@@ -295,13 +376,67 @@ def play_sample_kinematic(
             time.sleep(1.0 / 60.0)
 
         final_actuated = np.concatenate([arm_qpos, target_hand_qpos])
-        runtime.settle_actuated_pose(final_actuated, PROJECTION_SETTLE_STEPS)
+        runtime.set_robot_actuated_qpos(final_actuated, update_ctrl=True)
         for _ in range(max(1, hold_steps)):
             viewer.sync()
             time.sleep(1.0 / 60.0)
 
 
 def play_sample_dynamic(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    sample: PoseDrivenSample,
+    animate_steps: int,
+    hold_steps: int,
+    sim_substeps: int,
+    hold_arm_kp_scale: float,
+    hold_hand_kp_scale: float,
+    hold_support_scale: float,
+) -> None:
+    runtime.reset()
+    runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
+
+    start_actuated = runtime.get_actuated_qpos()
+    start_wrist_pose = wrist_pose_from_semantic_sites(runtime.get_semantic_sites_world())
+    target_wrist_pose = np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)
+    target_hand_qpos = np.asarray(sample.hand_qpos_6, dtype=np.float64)
+    ctrl_target = start_actuated.copy()
+    arm_qpos = start_actuated[:6].copy()
+
+    with mujoco_viewer.launch_passive(runtime.model, runtime.data) as viewer:
+        configure_camera(viewer.cam)
+        for step in range(max(1, animate_steps)):
+            alpha = float(step + 1) / float(max(1, animate_steps))
+            wrist_pose = interpolate_pose(start_wrist_pose, target_wrist_pose, alpha)
+            hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
+            arm_qpos = solve_arm_wrist_palm_ik(
+                runtime=runtime,
+                target_wrist_pose_world=wrist_pose,
+                initial_arm_qpos=arm_qpos,
+                hand_qpos=hand_qpos,
+                iterations=config.conversion.arm_ik_iterations,
+                damping=config.conversion.arm_ik_damping,
+            )
+            ctrl_target = runtime.clamp_actuated(np.concatenate([arm_qpos, hand_qpos]))
+            runtime.set_robot_actuated_qpos(ctrl_target, update_ctrl=True)
+            viewer.sync()
+            time.sleep(1.0 / 60.0)
+
+        final_ctrl = runtime.clamp_actuated(np.concatenate([arm_qpos, target_hand_qpos]))
+        _run_hold_validation_preview(
+            runtime,
+            config,
+            final_ctrl,
+            hold_steps,
+            sim_substeps,
+            hold_arm_kp_scale,
+            hold_hand_kp_scale,
+            hold_support_scale,
+            viewer,
+        )
+
+
+def play_sample_physics_approach(
     runtime: RobotSceneModel,
     config: TaskConfig,
     sample: PoseDrivenSample,
@@ -384,7 +519,7 @@ def play_samples_kinematic(
                 time.sleep(1.0 / 60.0)
 
             final_actuated = np.concatenate([arm_qpos, target_hand_qpos])
-            runtime.settle_actuated_pose(final_actuated, PROJECTION_SETTLE_STEPS)
+            runtime.set_robot_actuated_qpos(final_actuated, update_ctrl=True)
             for _ in range(max(1, hold_steps)):
                 viewer.sync()
                 time.sleep(1.0 / 60.0)
@@ -394,6 +529,68 @@ def play_samples_kinematic(
 
 
 def play_samples_dynamic(
+    runtime: RobotSceneModel,
+    config: TaskConfig,
+    selected_samples: list[tuple[int, PoseDrivenSample]],
+    samples_path: Path,
+    animate_steps: int,
+    hold_steps: int,
+    pause_steps: int,
+    sim_substeps: int,
+    hold_arm_kp_scale: float,
+    hold_hand_kp_scale: float,
+    hold_support_scale: float,
+) -> None:
+    with mujoco_viewer.launch_passive(runtime.model, runtime.data) as viewer:
+        configure_camera(viewer.cam)
+        for sample_index, sample in selected_samples:
+            print_sample_summary(sample_index, sample, samples_path)
+            runtime.reset()
+            runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
+
+            start_actuated = runtime.get_actuated_qpos()
+            start_wrist_pose = wrist_pose_from_semantic_sites(runtime.get_semantic_sites_world())
+            target_wrist_pose = np.asarray(sample.wrist_pose_goal_world, dtype=np.float64)
+            target_hand_qpos = np.asarray(sample.hand_qpos_6, dtype=np.float64)
+            ctrl_target = start_actuated.copy()
+            arm_qpos = start_actuated[:6].copy()
+
+            for step in range(max(1, animate_steps)):
+                alpha = float(step + 1) / float(max(1, animate_steps))
+                wrist_pose = interpolate_pose(start_wrist_pose, target_wrist_pose, alpha)
+                hand_qpos = (1.0 - alpha) * start_actuated[6:] + alpha * target_hand_qpos
+                arm_qpos = solve_arm_wrist_palm_ik(
+                    runtime=runtime,
+                    target_wrist_pose_world=wrist_pose,
+                    initial_arm_qpos=arm_qpos,
+                    hand_qpos=hand_qpos,
+                    iterations=config.conversion.arm_ik_iterations,
+                    damping=config.conversion.arm_ik_damping,
+                )
+                ctrl_target = runtime.clamp_actuated(np.concatenate([arm_qpos, hand_qpos]))
+                runtime.set_robot_actuated_qpos(ctrl_target, update_ctrl=True)
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+            final_ctrl = runtime.clamp_actuated(np.concatenate([arm_qpos, target_hand_qpos]))
+            _run_hold_validation_preview(
+                runtime,
+                config,
+                final_ctrl,
+                hold_steps,
+                sim_substeps,
+                hold_arm_kp_scale,
+                hold_hand_kp_scale,
+                hold_support_scale,
+                viewer,
+            )
+            for _ in range(max(0, pause_steps)):
+                runtime.set_robot_actuated_qpos(final_ctrl, update_ctrl=True)
+                viewer.sync()
+                time.sleep(1.0 / 60.0)
+
+
+def play_samples_physics_approach(
     runtime: RobotSceneModel,
     config: TaskConfig,
     selected_samples: list[tuple[int, PoseDrivenSample]],
@@ -483,8 +680,8 @@ def main() -> None:
         )
         return
 
-    if args.all:
-        play_samples_dynamic(
+    if args.all and args.physics_approach:
+        play_samples_physics_approach(
             runtime,
             config,
             selected_samples,
@@ -496,11 +693,48 @@ def main() -> None:
         )
         return
 
+    if args.all:
+        play_samples_dynamic(
+            runtime,
+            config,
+            selected_samples,
+            samples_path,
+            args.animate_steps,
+            args.hold_steps,
+            args.pause_steps,
+            args.sim_substeps,
+            args.hold_arm_kp_scale,
+            args.hold_hand_kp_scale,
+            args.hold_support_scale,
+        )
+        return
+
     if args.kinematic:
         play_sample_kinematic(runtime, config, sample, args.animate_steps, args.hold_steps)
         return
 
-    play_sample_dynamic(runtime, config, sample, args.animate_steps, args.hold_steps, args.sim_substeps)
+    if args.physics_approach:
+        play_sample_physics_approach(
+            runtime,
+            config,
+            sample,
+            args.animate_steps,
+            args.hold_steps,
+            args.sim_substeps,
+        )
+        return
+
+    play_sample_dynamic(
+        runtime,
+        config,
+        sample,
+        args.animate_steps,
+        args.hold_steps,
+        args.sim_substeps,
+        args.hold_arm_kp_scale,
+        args.hold_hand_kp_scale,
+        args.hold_support_scale,
+    )
 
 
 if __name__ == "__main__":

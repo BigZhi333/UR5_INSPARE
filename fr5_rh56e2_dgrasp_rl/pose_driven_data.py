@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sys
@@ -14,17 +14,9 @@ import numpy as np
 import torch
 from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.spatial.transform import Rotation
-try:
-    import pytorch_volumetric as pv
-except Exception:  # pragma: no cover - optional runtime backend
-    pv = None
-try:
-    import trimesh as tm
-except Exception:  # pragma: no cover - optional runtime backend
-    tm = None
 
 from .kinematics import solve_arm_wrist_palm_ik
-from .paths import BUNDLED_DGRASP_DIR, PROJECT_DIR, WORKSPACE_DIR, ensure_runtime_dirs, locate_dgrasp_root
+from .paths import BUNDLED_DGRASP_DIR, PROJECT_DIR, WORKSPACE_DIR, ensure_runtime_dirs
 from .robot_model import RobotSceneModel
 from .scene_builder import build_training_scene
 from .semantics import (
@@ -77,6 +69,8 @@ GENHAND_DIRECTION_WEIGHT = 2.2
 GENHAND_PALM_DIRECTION_WEIGHT = 1.6
 GENHAND_PALM_POSITION_WEIGHT = 1.8
 GENHAND_WRIST_POSITION_WEIGHT = 0.6
+GENHAND_FINGERTIP_POSITION_WEIGHT = 0.9
+GENHAND_THUMB_SIDE_WEIGHT = 0.8
 GENHAND_PENETRATION_WEIGHT = 18.0
 GENHAND_TABLE_WEIGHT = 10.0
 GENHAND_REACH_OBJECT_WEIGHT = 2.5
@@ -96,8 +90,8 @@ GENHAND_FORCE_CLOSURE_SIGMA_WEIGHT = 0.10
 GENHAND_FORCE_CLOSURE_SPREAD_WEIGHT = 0.05
 GENHAND_HDBSCAN_NORMAL_MIN_CLUSTER = 10
 GENHAND_HDBSCAN_POSITION_MIN_CLUSTER = 4
-GENHAND_FC_MAX_ITERS = 2000
-GENHAND_GF_MAX_ITERS = 1
+GENHAND_FC_MAX_ITERS = 120
+GENHAND_GF_MAX_ITERS = 60
 GENHAND_FC_LR = 1.0e-3
 GENHAND_GF_LR = 5.0e-3
 GENHAND_CONTACT_TARGET_TOL_M = 0.010
@@ -122,13 +116,6 @@ GENHAND_MANO_CONTACT_ZONES = {
     "little": [690, 689, 667, 695, 670, 694, 664, 683, 688, 665, 693, 691, 666, 687, 661, 663],
     "thumb": [743, 738, 768, 740, 763, 737, 766, 767, 764, 734, 735, 762, 745, 761, 717, 765],
 }
-
-
-@dataclass(frozen=True)
-class _MeshSurfaceQueryBackend:
-    mesh_path: str
-    mesh: Any
-    mesh_sdf: Any
 @dataclass
 class PoseDrivenSample:
     object_id: int
@@ -363,7 +350,6 @@ def _reachability_metrics_world(
         "downward_component": downward_component,
         "min_arm_table_clearance_m": min_arm_clearance,
     }
-
 
 def wrist_pose_to_target_sites(wrist_pose: np.ndarray) -> np.ndarray:
     wrist_pose = np.asarray(wrist_pose, dtype=np.float64)
@@ -802,9 +788,20 @@ def _load_genhand_fc_loss():
     except Exception:
         return None
     try:
-        return FCLoss(device="cpu")
+        fc_loss = FCLoss(device="cpu")
     except Exception:
         return None
+    try:
+        mu = float(GENHAND_FC_MU)
+        device = fc_loss.device
+        fc_loss.mu = torch.tensor(mu, dtype=torch.float32, device=device)
+        fc_loss.e1 = torch.tensor([mu, 0.0, 1.0], dtype=torch.float32, device=device).view(1, 1, 3)
+        fc_loss.e2 = torch.tensor([0.0, mu, 1.0], dtype=torch.float32, device=device).view(1, 1, 3)
+        fc_loss.e3 = torch.tensor([-mu, 0.0, 1.0], dtype=torch.float32, device=device).view(1, 1, 3)
+        fc_loss.e4 = torch.tensor([0.0, -mu, 1.0], dtype=torch.float32, device=device).view(1, 1, 3)
+    except Exception:
+        return None
+    return fc_loss
 
 
 @lru_cache(maxsize=1)
@@ -919,70 +916,6 @@ def _human_finger_directions_obj(source_keypoints_obj: np.ndarray) -> np.ndarray
     return np.asarray(directions, dtype=np.float64)
 
 
-def _resolve_object_surface_mesh_path(config: TaskConfig) -> Path | None:
-    build_mesh = config.project_dir / "build" / f"{config.object_name}_visual.obj"
-    if not build_mesh.exists():
-        try:
-            build_training_scene(config, force_rebuild=False)
-        except Exception:
-            pass
-    if build_mesh.exists():
-        return build_mesh.resolve()
-    source_mesh = locate_dgrasp_root() / "rsc" / "meshes_simplified" / config.object_name / "textured_meshlab.obj"
-    if source_mesh.exists():
-        return source_mesh.resolve()
-    return None
-
-
-@lru_cache(maxsize=16)
-def _load_object_mesh_surface_backend(mesh_path_text: str) -> _MeshSurfaceQueryBackend | None:
-    if pv is None or tm is None:
-        return None
-    mesh_path = Path(mesh_path_text)
-    if not mesh_path.exists():
-        return None
-    mesh = tm.load_mesh(mesh_path, process=False)
-    if isinstance(mesh, tm.Scene):
-        geometries = list(mesh.geometry.values())
-        if not geometries:
-            return None
-        mesh = tm.util.concatenate(tuple(geometries))
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    mesh_sdf = pv.MeshSDF(
-        pv.MeshObjectFactory(
-            mesh_name=None,
-            preload_mesh={
-                "vertices": vertices,
-                "faces": faces,
-            },
-        )
-    )
-    return _MeshSurfaceQueryBackend(
-        mesh_path=str(mesh_path),
-        mesh=mesh,
-        mesh_sdf=mesh_sdf,
-    )
-
-
-def _get_object_mesh_surface_backend(config: TaskConfig) -> _MeshSurfaceQueryBackend | None:
-    mesh_path = _resolve_object_surface_mesh_path(config)
-    if mesh_path is None:
-        return None
-    try:
-        return _load_object_mesh_surface_backend(str(mesh_path))
-    except Exception:
-        return None
-
-
-def _object_surface_backend_name(config: TaskConfig) -> str:
-    return "mesh_sdf" if _get_object_mesh_surface_backend(config) is not None else f"analytic_{config.object_geom_type}"
-
-
-def _genhand_lr_schedule(initial_lr: float, step_index: int, interval: int = 1000, factor: float = 0.6) -> float:
-    return float(initial_lr * (factor ** (step_index // interval)))
-
-
 def _project_point_to_box_surface(point_obj: np.ndarray, dims_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     half_extents = 0.5 * np.asarray(dims_m, dtype=np.float64)
     point_obj = np.asarray(point_obj, dtype=np.float64).reshape(3)
@@ -1053,15 +986,6 @@ def _project_targets_to_object_surface(
     target_points_obj: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     target_points_obj = np.asarray(target_points_obj, dtype=np.float64).reshape(-1, 3)
-    mesh_backend = _get_object_mesh_surface_backend(config)
-    if mesh_backend is not None and tm is not None:
-        try:
-            closest_points, _distance, face_index = tm.proximity.closest_point(mesh_backend.mesh, target_points_obj)
-            projected_normals = np.asarray(mesh_backend.mesh.face_normals[np.asarray(face_index, dtype=np.int64)], dtype=np.float64)
-            projected_normals = np.asarray([normalize(normal) for normal in projected_normals], dtype=np.float64)
-            return np.asarray(closest_points, dtype=np.float64), projected_normals
-        except Exception:
-            pass
     projected_points = np.zeros_like(target_points_obj)
     projected_normals = np.zeros_like(target_points_obj)
     for idx, point in enumerate(target_points_obj):
@@ -1168,13 +1092,6 @@ def _object_surface_query_torch(
     points = points_obj
     if points.dim() == 2:
         points = points.unsqueeze(0)
-    mesh_backend = _get_object_mesh_surface_backend(config)
-    if mesh_backend is not None:
-        query_points = points.reshape(-1, 3).to(dtype=torch.float32)
-        sdf, normals = mesh_backend.mesh_sdf(query_points)
-        sdf = sdf.reshape(points.shape[:-1])
-        normals = normals.reshape(points.shape)
-        return sdf, normals
     if config.object_geom_type == "box":
         half = torch.tensor(np.asarray(config.object_dims_m, dtype=np.float32) * 0.5, dtype=torch.float32, device=points.device)
         abs_points = torch.abs(points)
@@ -1381,18 +1298,30 @@ def _optimize_force_closure_targets_obj(
             "fc_distance": 0.0,
             "fc_inter_dist": 0.0,
         }
-    fc_loss.mu = torch.tensor(GENHAND_FC_MU, dtype=torch.float32).to(fc_loss.device)
 
     x = torch.tensor(initial_targets, dtype=torch.float32).unsqueeze(0).requires_grad_(True)
     w = (torch.ones((1, initial_targets.shape[0], 4), dtype=torch.float32) * 0.25).requires_grad_(True)
     contact_target = torch.tensor(initial_targets, dtype=torch.float32)
     relu = torch.nn.ReLU()
 
+    def stable_lin_ind(G_tensor: torch.Tensor) -> torch.Tensor:
+        Gt = G_tensor.transpose(1, 2)
+        base = torch.matmul(G_tensor, Gt) - fc_loss.eps * fc_loss.eye6
+        eye = fc_loss.eye6
+        for jitter in (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+            try:
+                eigval = torch.linalg.eigvalsh(base + jitter * eye, UPLO="U").to(fc_loss.device)
+                rnev = relu(-eigval)
+                return torch.sum(rnev * rnev, 1)
+            except Exception:
+                continue
+        return torch.full((G_tensor.shape[0],), 1.0e3, dtype=torch.float32, device=fc_loss.device)
+
     def fc_terms(x_tensor: torch.Tensor, w_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
         sdf_val, surface_normals = _object_surface_query_torch(config, x_tensor)
         x_norm = x_tensor / torch.clamp(torch.linalg.norm(x_tensor, dim=-1).amax(), min=1e-8)
         G = fc_loss.x_to_G(x_norm)
-        lin_ind = fc_loss.lin_ind(G)
+        lin_ind = stable_lin_ind(G)
         f, _edge_forces = fc_loss.linearized_cone(surface_normals, w_tensor)
         net_wrench = fc_loss.net_wrench(f, G)
         int_fc = fc_loss.inter_fc(w_tensor)
@@ -1413,10 +1342,7 @@ def _optimize_force_closure_targets_obj(
     opt_fc = torch.optim.Adam([x, w], lr=GENHAND_FC_LR)
     best = None
     best_loss = float("inf")
-    for fc_iter in range(GENHAND_FC_MAX_ITERS):
-        fc_lr = _genhand_lr_schedule(GENHAND_FC_LR, fc_iter)
-        for group in opt_fc.param_groups:
-            group["lr"] = fc_lr
+    for _ in range(GENHAND_FC_MAX_ITERS):
         opt_fc.zero_grad()
         data = fc_terms(x, w)
         data["loss"].backward()
@@ -1441,10 +1367,7 @@ def _optimize_force_closure_targets_obj(
         x = best[0].requires_grad_(False)
         w = best[1].requires_grad_(True)
     opt_gf = torch.optim.Adam([w], lr=GENHAND_GF_LR)
-    for gf_iter in range(GENHAND_GF_MAX_ITERS):
-        gf_lr = _genhand_lr_schedule(GENHAND_GF_LR, gf_iter)
-        for group in opt_gf.param_groups:
-            group["lr"] = gf_lr
+    for _ in range(GENHAND_GF_MAX_ITERS):
         opt_gf.zero_grad()
         data = fc_terms(x, w)
         gf_loss = data["net_wrench"] + data["lin_ind"] + data["int_fc"]
@@ -1458,12 +1381,12 @@ def _optimize_force_closure_targets_obj(
     final_terms = fc_terms(x, w)
     metrics = {
         "fc_loss": float(final_terms["loss"].detach().cpu().item()),
+        "fc_mu": float(GENHAND_FC_MU),
         "fc_net_wrench": float(final_terms["net_wrench"].detach().cpu().item()),
         "fc_lin_ind": float(final_terms["lin_ind"].detach().cpu().item()),
         "fc_intfc": float(final_terms["int_fc"].detach().cpu().item()),
         "fc_distance": float(final_terms["distance"].detach().cpu().item()),
         "fc_inter_dist": float(final_terms["inter_dist"].detach().cpu().item()),
-        "fc_mu": float(GENHAND_FC_MU),
     }
     return projected_points, projected_normals, metrics
 
@@ -1775,6 +1698,7 @@ def _box_genhand_seed_states(
         object_pose_goal=object_pose_goal,
         source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
+    source_thumb_side = normalize(source_semantic_sites_obj[2] - source_semantic_sites_obj[1])
     contact_centroid = np.mean(source_contact_targets_obj, axis=0) if source_contact_targets_obj.size else source_semantic_sites_obj[1]
     averaged_normal = normalize(np.mean(source_contact_normals_obj, axis=0)) if source_contact_normals_obj.size else -source_frame_obj[:, 2]
     if np.linalg.norm(averaged_normal) < 1e-8:
@@ -1785,8 +1709,13 @@ def _box_genhand_seed_states(
     if np.linalg.norm(across) < 1e-8:
         across = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     across = normalize(across)
+    if float(np.dot(source_thumb_side, across)) < 0.0:
+        across = -across
     normal = normalize(np.cross(across, desired_approach))
     across = normalize(np.cross(desired_approach, normal))
+    if float(np.dot(source_thumb_side, across)) < 0.0:
+        across = -across
+        normal = -normal
     seed_variants = _genhand_hand_seed_variants(runtime, base_hand_qpos)
     relaxed_hand = seed_variants["relaxed"]
     contact_biased_hand = seed_variants["balanced"]
@@ -1812,6 +1741,20 @@ def _box_genhand_seed_states(
     translation_local, rotvec_local = _pose_delta_local(source_wrist_pose_object, target_pose_object_7)
     seeds.append((translation_local, rotvec_local, contact_biased_hand))
     seeds.append((translation_local, rotvec_local, aggressive_hand))
+    seeds.append(
+        (
+            translation_local,
+            rotvec_local + desired_approach * np.deg2rad(8.0),
+            thumb_lead_hand,
+        )
+    )
+    seeds.append(
+        (
+            translation_local,
+            rotvec_local - desired_approach * np.deg2rad(8.0),
+            contact_biased_hand,
+        )
+    )
     return seeds
 
 
@@ -1824,10 +1767,11 @@ def _optimize_genhand_seed(
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
     source_dgrasp_qpos_world: np.ndarray | None,
+    initial_arm_qpos: np.ndarray,
     initial_translation_local: np.ndarray,
     initial_rotvec_local: np.ndarray,
     initial_hand_qpos: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     source_wrist_pose_object = compose_pose7(inverse_pose7(object_pose_goal), source_wrist_pose_world)
     source_semantic_sites_obj = transform_points(source_semantic_sites_world, inverse_pose7(object_pose_goal))
     source_contact_targets_obj, source_contact_normals_obj, _fc_metrics = _human_surface_contact_anchors_obj(
@@ -1836,10 +1780,12 @@ def _optimize_genhand_seed(
         source_dgrasp_qpos_world=source_dgrasp_qpos_world,
     )
     source_finger_dirs_obj = _human_finger_directions_obj(source_keypoints_obj)
+    source_thumb_side_obj = normalize(source_semantic_sites_obj[2] - source_semantic_sites_obj[1])
     object_rotation = quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64))
     inv_object_rotation = object_rotation.T
     table_top_z = runtime.get_table_top_z()
 
+    initial_arm_qpos = runtime.clamp_arm(np.asarray(initial_arm_qpos, dtype=np.float64))
     initial_translation_local = np.asarray(initial_translation_local, dtype=np.float64)
     initial_rotvec_local = np.asarray(initial_rotvec_local, dtype=np.float64)
     initial_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
@@ -1873,7 +1819,7 @@ def _optimize_genhand_seed(
         arm_qpos = solve_arm_wrist_palm_ik(
             runtime=runtime,
             target_wrist_pose_world=target_wrist_pose_world,
-            initial_arm_qpos=runtime.home_actuated[:6],
+            initial_arm_qpos=initial_arm_qpos,
             hand_qpos=hand_qpos,
             iterations=max(42, int(config.conversion.arm_ik_iterations * 0.45)),
             damping=config.conversion.arm_ik_damping,
@@ -1882,6 +1828,7 @@ def _optimize_genhand_seed(
         runtime.reset()
         runtime.set_object_pose(object_pose_goal)
         runtime.set_robot_actuated_qpos(np.concatenate([arm_qpos, hand_qpos]))
+
         contact_candidate_point_sets_world, contact_candidate_normal_sets_world, _contact_candidate_families = runtime.get_contact_candidate_point_sets_world()
         contact_candidate_point_sets_obj = transform_points(
             contact_candidate_point_sets_world.reshape(-1, 3),
@@ -1926,6 +1873,14 @@ def _optimize_genhand_seed(
         residuals.extend((GENHAND_PALM_DIRECTION_WEIGHT * (current_palm_approach - desired_palm_approach)).tolist())
         residuals.extend((GENHAND_PALM_POSITION_WEIGHT * (semantic_sites_obj[1] - source_semantic_sites_obj[1])).tolist())
         residuals.extend((GENHAND_WRIST_POSITION_WEIGHT * (semantic_sites_obj[0] - source_semantic_sites_obj[0])).tolist())
+        residuals.extend(
+            (
+                GENHAND_FINGERTIP_POSITION_WEIGHT
+                * (semantic_sites_obj[2:] - source_semantic_sites_obj[2:]).reshape(-1)
+            ).tolist()
+        )
+        current_thumb_side_obj = normalize(semantic_sites_obj[2] - semantic_sites_obj[1])
+        residuals.extend((GENHAND_THUMB_SIDE_WEIGHT * (current_thumb_side_obj - source_thumb_side_obj)).tolist())
 
         if source_contact_targets_obj.size:
             aligned_targets = source_contact_targets_obj[np.asarray(assigned_targets, dtype=np.int64)]
@@ -1980,10 +1935,28 @@ def _optimize_genhand_seed(
         max_nfev=GENHAND_MAX_NFEV,
     )
     optimized = np.asarray(result.x, dtype=np.float64)
+    final_translation = optimized[:3].copy()
+    final_rotvec = optimized[3:6].copy()
+    final_hand_qpos = runtime.clamp_hand(optimized[6:]).copy()
+    final_target_wrist_pose_object = apply_local_pose_delta(
+        source_wrist_pose_object,
+        final_translation,
+        final_rotvec,
+    )
+    final_target_wrist_pose_world = compose_pose7(object_pose_goal, final_target_wrist_pose_object)
+    final_arm_qpos = solve_arm_wrist_palm_ik(
+        runtime=runtime,
+        target_wrist_pose_world=final_target_wrist_pose_world,
+        initial_arm_qpos=initial_arm_qpos,
+        hand_qpos=final_hand_qpos,
+        iterations=max(42, int(config.conversion.arm_ik_iterations * 0.45)),
+        damping=config.conversion.arm_ik_damping,
+    )
     return (
-        optimized[:3].copy(),
-        optimized[3:6].copy(),
-        runtime.clamp_hand(optimized[6:]).copy(),
+        final_translation,
+        final_rotvec,
+        final_hand_qpos,
+        final_arm_qpos,
         float(result.cost),
     )
 
@@ -2021,8 +1994,6 @@ def _required_target_contact_count(source_contact_mask_12: np.ndarray | None = N
 
 def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> tuple[float, ...]:
     is_cylinder = "cylinder_palm_clearance_error_m" in candidate
-    matched_contacts = float(candidate["source_matched_target_contacts"])
-    extra_contacts = float(candidate["source_extra_contacts"])
     table_contact = 1.0 if bool(candidate["table_contact"]) else 0.0
     max_penetration = float(candidate["max_penetration_m"])
     total_penetration = float(candidate["total_penetration_m"])
@@ -2055,16 +2026,9 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         + 80.0 * hard_translation_drift_over
         + 2.0 * hard_rotation_drift_over
     )
-    settled_contact_shortfall = max(0.0, 2.0 - float(candidate.get("settled_contact_group_count", 0.0)))
-    settled_hard_shortfall = max(0.0, 1.0 - float(candidate.get("settled_hard_contact_group_count", 0.0)))
-    settled_opposition_missing = 0.0 if bool(candidate.get("settled_has_thumb_opposition", False)) else 1.0
-    hold_drop_over = max(0.0, float(candidate["hold_object_drop_m"]) - PROJECTION_HOLD_MAX_DROP_M)
-    hold_translation_over = max(0.0, float(candidate["hold_object_translation_m"]) - PROJECTION_HOLD_MAX_TRANSLATION_M)
-    hold_rotation_over = max(0.0, float(candidate["hold_object_rotation_deg"]) - PROJECTION_HOLD_MAX_ROTATION_DEG)
-    hold_table_contact = 1.0 if bool(candidate["hold_table_contact"]) else 0.0
-    hold_hybrid_shortfall = max(0.0, 2.0 - float(candidate["hold_hybrid_contact_group_count"]))
-    hold_hard_shortfall = max(0.0, 1.0 - float(candidate["hold_hard_contact_group_count"]))
-    hold_opposition_missing = 0.0 if bool(candidate["hold_has_thumb_opposition"]) else 1.0
+    static_contact_shortfall = max(0.0, 2.0 - float(candidate.get("static_contact_group_count", 0.0)))
+    static_hard_shortfall = max(0.0, 1.0 - float(candidate.get("static_hard_contact_group_count", 0.0)))
+    static_opposition_missing = 0.0 if bool(candidate.get("static_has_thumb_opposition", False)) else 1.0
     reach_object_shortfall = max(
         0.0,
         REACHABILITY_MIN_OBJECT_FACING_COS - float(candidate.get("reach_object_facing_cos", 1.0)),
@@ -2086,15 +2050,6 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         + 8.0 * reach_base_violation
         + 6.0 * reach_downward_violation
         + 40.0 * reach_arm_table_violation
-    )
-    hold_quality_violation = (
-        100.0 * hold_table_contact
-        + 50.0 * hold_drop_over
-        + 10.0 * hold_translation_over
-        + 0.5 * hold_rotation_over
-        + 6.0 * hold_hybrid_shortfall
-        + 4.0 * hold_hard_shortfall
-        + 3.0 * hold_opposition_missing
     )
     fc_quality_violation = (
         16.0 * float(candidate.get("genhand_target_anchor_rmse_m", 0.0))
@@ -2120,23 +2075,15 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
             0.0,
             float(candidate["cylinder_opposition_cos"]) - PROJECTION_CYLINDER_OPPOSITION_TARGET_COS,
         )
-        cylinder_wrap_violation += 80.0 * max(
+        cylinder_wrap_violation += 2.0 * max(
             0.0,
-            float(candidate["hold_cylinder_palm_clearance_error_m"]) - PROJECTION_CYLINDER_HOLD_PALM_CLEARANCE_TOL_M,
-        )
-        cylinder_wrap_violation += 10.0 * max(
-            0.0,
-            float(candidate["hold_cylinder_opposition_cos"]) - PROJECTION_CYLINDER_HOLD_OPPOSITION_TARGET_COS,
+            2.0 - float(candidate.get("static_contact_group_count", 0.0)),
         )
         cylinder_wrap_violation += 2.0 * max(
             0.0,
-            2.0 - float(candidate.get("settled_contact_group_count", 0.0)),
+            1.0 - float(candidate.get("static_hard_contact_group_count", 0.0)),
         )
-        cylinder_wrap_violation += 2.0 * max(
-            0.0,
-            1.0 - float(candidate.get("settled_hard_contact_group_count", 0.0)),
-        )
-        cylinder_wrap_violation += 1.5 * float(not bool(candidate.get("settled_has_thumb_opposition", False)))
+        cylinder_wrap_violation += 1.5 * float(not bool(candidate.get("static_has_thumb_opposition", False)))
 
     if hard_safety_violation <= 1e-9:
         return (
@@ -2144,11 +2091,10 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
             reachability_violation,
             fc_quality_violation,
             kinematic_quality_violation,
-            hold_quality_violation,
             cylinder_wrap_violation,
-            settled_contact_shortfall,
-            settled_hard_shortfall,
-            settled_opposition_missing,
+            static_contact_shortfall,
+            static_hard_shortfall,
+            static_opposition_missing,
             soft_safety_violation,
             object_translation_drift,
             max_penetration,
@@ -2161,11 +2107,10 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
         reachability_violation,
         fc_quality_violation,
         kinematic_quality_violation,
-        hold_quality_violation,
         cylinder_wrap_violation,
-        settled_contact_shortfall,
-        settled_hard_shortfall,
-        settled_opposition_missing,
+        static_contact_shortfall,
+        static_hard_shortfall,
+        static_opposition_missing,
         soft_safety_violation,
         object_translation_drift,
         max_penetration,
@@ -2175,6 +2120,7 @@ def _projection_rank_key(candidate: dict[str, Any], required_contacts: int) -> t
 
 
 def _projection_preshortlist_rank_key(candidate: dict[str, Any], required_contacts: int) -> tuple[float, ...]:
+    del required_contacts
     table_contact = 1.0 if bool(candidate["table_contact"]) else 0.0
     hard_safety_violation = (
         10.0 * table_contact
@@ -2203,17 +2149,17 @@ def _projection_preshortlist_rank_key(candidate: dict[str, Any], required_contac
         + 2.0 * float(candidate["source_site_rmse_m"])
         + 0.010 * float(candidate["source_semantic_frame_error_deg"])
     )
-    settled_contact_shortfall = max(0.0, 2.0 - float(candidate.get("settled_contact_group_count", 0.0)))
-    settled_hard_shortfall = max(0.0, 1.0 - float(candidate.get("settled_hard_contact_group_count", 0.0)))
-    settled_opposition_missing = 0.0 if bool(candidate.get("settled_has_thumb_opposition", False)) else 1.0
+    static_contact_shortfall = max(0.0, 2.0 - float(candidate.get("static_contact_group_count", 0.0)))
+    static_hard_shortfall = max(0.0, 1.0 - float(candidate.get("static_hard_contact_group_count", 0.0)))
+    static_opposition_missing = 0.0 if bool(candidate.get("static_has_thumb_opposition", False)) else 1.0
     return (
         hard_safety_violation,
         reachability_violation,
         fc_quality_violation,
         kinematic_quality_violation,
-        settled_contact_shortfall,
-        settled_hard_shortfall,
-        settled_opposition_missing,
+        static_contact_shortfall,
+        static_hard_shortfall,
+        static_opposition_missing,
         float(candidate["object_translation_drift_m"]),
         float(candidate["max_penetration_m"]),
         float(np.linalg.norm(np.asarray(candidate["wrist_translation_local"], dtype=np.float64))),
@@ -2241,7 +2187,7 @@ def _evaluate_projected_candidate(
     wrist_translation_local: np.ndarray,
     wrist_rotvec_local: np.ndarray,
     hand_qpos: np.ndarray,
-    run_hold_test: bool = True,
+    initial_arm_qpos: np.ndarray | None = None,
 ) -> dict[str, Any]:
     wrist_translation_local = np.asarray(wrist_translation_local, dtype=np.float64)
     wrist_rotvec_local = np.asarray(wrist_rotvec_local, dtype=np.float64)
@@ -2257,60 +2203,54 @@ def _evaluate_projected_candidate(
     candidate_arm_qpos = solve_arm_wrist_palm_ik(
         runtime=runtime,
         target_wrist_pose_world=candidate_wrist_pose,
-        initial_arm_qpos=runtime.home_actuated[:6],
+        initial_arm_qpos=runtime.home_actuated[:6] if initial_arm_qpos is None else np.asarray(initial_arm_qpos, dtype=np.float64),
         hand_qpos=candidate_hand_qpos,
         iterations=max(48, int(config.conversion.arm_ik_iterations * 0.6)),
         damping=config.conversion.arm_ik_damping,
     )
     target_actuated_qpos = np.concatenate([candidate_arm_qpos, candidate_hand_qpos])
+
     runtime.reset()
     runtime.set_object_pose(object_pose_goal)
-    runtime.settle_actuated_pose(target_actuated_qpos, PROJECTION_SETTLE_STEPS)
-    settled_actuated_qpos = runtime.get_actuated_qpos()
-    settled_sites = runtime.get_semantic_sites_world()
-    settled_wrist_pose = wrist_pose_from_semantic_sites(settled_sites)
-    settled_frame = quat_wxyz_to_matrix(settled_wrist_pose[3:])
-    settled_contact_diag = runtime.get_contact_diagnostics_12()
-    settled_hard_contact_mask = np.asarray(settled_contact_diag["hard_mask"], dtype=np.float64)
-    settled_proximity_mask = np.asarray(settled_contact_diag["proximity_mask"], dtype=np.float64)
-    settled_contact_mask = np.asarray(settled_contact_diag["hybrid_mask"], dtype=np.float64)
-    settled_proximity_scores = np.asarray(settled_contact_diag["proximity_scores"], dtype=np.float64)
-    settled_contact_distances = np.asarray(settled_contact_diag["distances_m"], dtype=np.float64)
-    settled_object_pose = runtime.get_object_pose()
-    goal_object_frame = quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64))
-    if run_hold_test:
-        hold_result = _run_projection_hold_test(
-            runtime=runtime,
-            config=config,
-            ctrl_target=settled_actuated_qpos,
-        )
-        final_contact_diag = hold_result["contact_diag"]
-        hold_object_drop_m = float(hold_result["object_drop_m"])
-        hold_object_translation_m = float(hold_result["object_translation_m"])
-        hold_object_rotation_deg = float(hold_result["object_rotation_deg"])
-        hold_table_contact = bool(final_contact_diag["table_contact"])
-    else:
-        final_contact_diag = settled_contact_diag
-        hold_object_drop_m = 0.0
-        hold_object_translation_m = 0.0
-        hold_object_rotation_deg = 0.0
-        hold_table_contact = bool(final_contact_diag["table_contact"])
-    final_actuated_qpos = settled_actuated_qpos.copy()
-    final_sites = settled_sites.copy()
-    final_wrist_pose = settled_wrist_pose.copy()
-    final_frame = settled_frame.copy()
-    final_object_pose = settled_object_pose.copy()
-    final_hard_contact_mask = settled_hard_contact_mask.copy()
-    final_proximity_mask = settled_proximity_mask.copy()
-    final_contact_mask = settled_contact_mask.copy()
-    final_proximity_scores = settled_proximity_scores.copy()
-    final_contact_distances = settled_contact_distances.copy()
-    final_contact_points_world = runtime.get_contact_proxy_points_world_12().copy()
+    runtime.set_robot_actuated_qpos(target_actuated_qpos)
+    static_actuated_qpos = runtime.get_actuated_qpos()
+    static_sites = runtime.get_semantic_sites_world()
+    static_wrist_pose = wrist_pose_from_semantic_sites(static_sites)
+    static_frame = quat_wxyz_to_matrix(static_wrist_pose[3:])
+    static_contact_diag = runtime.get_contact_diagnostics_12()
+    static_hard_contact_mask = np.asarray(static_contact_diag["hard_mask"], dtype=np.float64)
+    static_proximity_mask = np.asarray(static_contact_diag["proximity_mask"], dtype=np.float64)
+    static_contact_mask = np.asarray(static_contact_diag["hybrid_mask"], dtype=np.float64)
+    static_proximity_scores = np.asarray(static_contact_diag["proximity_scores"], dtype=np.float64)
+    static_contact_distances = np.asarray(static_contact_diag["distances_m"], dtype=np.float64)
+    static_object_pose = runtime.get_object_pose()
+    static_contact_points_world = runtime.get_contact_proxy_points_world_12().copy()
+    (
+        static_contact_candidate_point_sets_world,
+        static_contact_candidate_normal_sets_world,
+        static_contact_candidate_families,
+    ) = runtime.get_contact_candidate_point_sets_world()
+    static_arm_table_clearance_m = runtime.get_arm_sweep_table_clearance()
+    final_actuated_qpos = static_actuated_qpos.copy()
+    final_sites = static_sites.copy()
+    final_wrist_pose = static_wrist_pose.copy()
+    final_frame = static_frame.copy()
+    final_object_pose = static_object_pose.copy()
+    final_hard_contact_mask = static_hard_contact_mask.copy()
+    final_proximity_mask = static_proximity_mask.copy()
+    final_contact_mask = static_contact_mask.copy()
+    final_proximity_scores = static_proximity_scores.copy()
+    final_contact_distances = static_contact_distances.copy()
+    final_contact_points_world = static_contact_points_world.copy()
     (
         final_contact_candidate_point_sets_world,
         final_contact_candidate_normal_sets_world,
         final_contact_candidate_families,
-    ) = runtime.get_contact_candidate_point_sets_world()
+    ) = (
+        np.asarray(static_contact_candidate_point_sets_world, dtype=np.float64).copy(),
+        np.asarray(static_contact_candidate_normal_sets_world, dtype=np.float64).copy(),
+        np.asarray(static_contact_candidate_families, dtype=np.int64).copy(),
+    )
     final_object_frame = quat_wxyz_to_matrix(final_object_pose[3:])
 
     wrist_error = float(np.linalg.norm(final_sites[0] - source_semantic_sites_world[0]))
@@ -2329,40 +2269,44 @@ def _evaluate_projected_candidate(
     contact_shortfall = max(0.0, float(required_contacts) - matched_target_contacts)
     translation_norm = float(np.linalg.norm(wrist_translation_local))
     rotation_norm = float(np.linalg.norm(wrist_rotvec_local))
-    object_translation_drift_m = float(np.linalg.norm(final_object_pose[:3] - np.asarray(object_pose_goal[:3], dtype=np.float64)))
-    object_rotation_drift_deg = float(rotation_angle_deg(final_object_frame, goal_object_frame))
-    settled_contact_group_count = float(_contact_group_count(final_contact_mask))
-    settled_hard_contact_group_count = float(_contact_group_count(final_hard_contact_mask))
-    settled_has_thumb_opposition = bool(_has_thumb_opposition(final_contact_mask))
+    object_translation_drift_m = float(
+        np.linalg.norm(final_object_pose[:3] - np.asarray(object_pose_goal[:3], dtype=np.float64))
+    )
+    object_rotation_drift_deg = float(
+        rotation_angle_deg(quat_wxyz_to_matrix(final_object_pose[3:]), quat_wxyz_to_matrix(np.asarray(object_pose_goal[3:], dtype=np.float64)))
+    )
+    static_contact_group_count = float(_contact_group_count(final_contact_mask))
+    static_hard_contact_group_count = float(_contact_group_count(final_hard_contact_mask))
+    static_has_thumb_opposition = bool(_has_thumb_opposition(final_contact_mask))
+    settled_contact_group_count = static_contact_group_count
+    settled_hard_contact_group_count = static_hard_contact_group_count
+    settled_has_thumb_opposition = static_has_thumb_opposition
     cylinder_palm_clearance_error_m, cylinder_opposition_cos = _cylinder_grasp_geometry_metrics(
         config,
         final_object_pose,
         final_sites,
         source_contact_mask_12,
     )
-    hold_contact_mask = np.asarray(final_contact_diag["hybrid_mask"], dtype=np.float64)
-    hold_hard_contact_mask = np.asarray(final_contact_diag["hard_mask"], dtype=np.float64)
-    hold_matched_target_contacts = float(np.sum((source_contact_mask_12 > 0.5) & (hold_contact_mask > 0.5)))
-    hold_hybrid_contact_group_count = float(_contact_group_count(hold_contact_mask))
-    hold_hard_contact_group_count = float(_contact_group_count(hold_hard_contact_mask))
-    hold_has_thumb_opposition = bool(_has_thumb_opposition(hold_contact_mask))
-    hold_cylinder_palm_clearance_error_m, hold_cylinder_opposition_cos = _cylinder_grasp_geometry_metrics(
-        config,
-        np.asarray(hold_result["object_pose"], dtype=np.float64) if run_hold_test else final_object_pose,
-        np.asarray(hold_result["semantic_sites_world"], dtype=np.float64) if run_hold_test else final_sites,
-        source_contact_mask_12,
-    )
-    arm_table_clearance_m = runtime.get_arm_sweep_table_clearance()
+    hold_matched_target_contacts = 0.0
+    hold_hybrid_contact_group_count = 0.0
+    hold_hard_contact_group_count = 0.0
+    hold_has_thumb_opposition = False
+    hold_cylinder_palm_clearance_error_m = 0.0
+    hold_cylinder_opposition_cos = 0.0
+    hold_object_drop_m = 0.0
+    hold_object_translation_m = 0.0
+    hold_object_rotation_deg = 0.0
+    hold_table_contact = False
     reachability_metrics = _reachability_metrics_world(
         object_pose_goal=object_pose_goal,
         semantic_sites_world=final_sites,
-        arm_table_clearance_m=arm_table_clearance_m,
+        arm_table_clearance_m=static_arm_table_clearance_m,
     )
     object_facing_shortfall = max(0.0, REACHABILITY_MIN_OBJECT_FACING_COS - reachability_metrics["object_facing_cos"])
     base_facing_violation = max(0.0, reachability_metrics["base_facing_cos"] - REACHABILITY_MAX_BASE_FACING_COS)
     downward_violation = max(0.0, REACHABILITY_MIN_DOWNWARD_APPROACH - reachability_metrics["downward_component"])
     arm_clearance_violation_sum = float(
-        np.sum(np.maximum(REACHABILITY_MIN_ARM_TABLE_CLEARANCE_M - arm_table_clearance_m, 0.0))
+        np.sum(np.maximum(REACHABILITY_MIN_ARM_TABLE_CLEARANCE_M - static_arm_table_clearance_m, 0.0))
     )
 
     object_translation_weight = 2.00 if config.object_geom_type == "cylinder" else 1.25
@@ -2370,33 +2314,24 @@ def _evaluate_projected_candidate(
     source_frame_weight = 0.0001 if config.object_geom_type == "cylinder" else 0.0002
     score = (
         site_rmse
-        + 28.0 * float(final_contact_diag["total_penetration_m"])
-        + 48.0 * float(final_contact_diag["max_penetration_m"])
-        + 0.02 * float(bool(final_contact_diag["table_contact"]))
+        + 28.0 * float(static_contact_diag["total_penetration_m"])
+        + 48.0 * float(static_contact_diag["max_penetration_m"])
+        + 0.02 * float(bool(static_contact_diag["table_contact"]))
         + 0.20 * translation_norm
         + 0.05 * rotation_norm
         + object_translation_weight * object_translation_drift_m
         + object_rotation_weight * object_rotation_drift_deg
         + 0.01 * float(np.linalg.norm(candidate_hand_qpos - runtime.home_actuated[6:]))
         + source_frame_weight * frame_error_deg
-        + 0.45 * float(max(0.0, 2.0 - settled_contact_group_count))
-        + 0.25 * float(max(0.0, 1.0 - settled_hard_contact_group_count))
-        + 0.45 * float(not settled_has_thumb_opposition)
+        + 0.45 * float(max(0.0, 2.0 - static_contact_group_count))
+        + 0.25 * float(max(0.0, 1.0 - static_hard_contact_group_count))
+        + 0.45 * float(not static_has_thumb_opposition)
         + 1.20 * object_facing_shortfall
         + 1.20 * base_facing_violation
         + 0.80 * downward_violation
         + 3.50 * arm_clearance_violation_sum
         + 4.0 * max(0.0, cylinder_palm_clearance_error_m - PROJECTION_CYLINDER_PALM_CLEARANCE_TOL_M)
         + 1.50 * max(0.0, cylinder_opposition_cos - PROJECTION_CYLINDER_OPPOSITION_TARGET_COS)
-        + 14.0 * hold_object_drop_m
-        + 2.5 * hold_object_translation_m
-        + 0.050 * hold_object_rotation_deg
-        + 1.50 * float(max(0.0, 2.0 - hold_hybrid_contact_group_count))
-        + 1.00 * float(max(0.0, 1.0 - hold_hard_contact_group_count))
-        + 1.50 * float(not hold_has_thumb_opposition)
-        + 6.0 * max(0.0, hold_cylinder_palm_clearance_error_m - PROJECTION_CYLINDER_HOLD_PALM_CLEARANCE_TOL_M)
-        + 2.00 * max(0.0, hold_cylinder_opposition_cos - PROJECTION_CYLINDER_HOLD_OPPOSITION_TARGET_COS)
-        - 0.03 * hold_hard_contact_group_count
     )
 
     return {
@@ -2421,10 +2356,10 @@ def _evaluate_projected_candidate(
         "contact_candidate_normal_sets_world": np.asarray(final_contact_candidate_normal_sets_world, dtype=np.float64).copy(),
         "contact_candidate_points_world": np.asarray(final_contact_candidate_point_sets_world, dtype=np.float64).reshape(-1, 3).copy(),
         "contact_candidate_family_indices": np.asarray(final_contact_candidate_families, dtype=np.int64).copy(),
-        "contact_forces_12": np.asarray(final_contact_diag["forces"], dtype=np.float64).copy(),
-        "table_contact": bool(final_contact_diag["table_contact"]),
-        "total_penetration_m": float(final_contact_diag["total_penetration_m"]),
-        "max_penetration_m": float(final_contact_diag["max_penetration_m"]),
+        "contact_forces_12": np.asarray(static_contact_diag["forces"], dtype=np.float64).copy(),
+        "table_contact": bool(static_contact_diag["table_contact"]),
+        "total_penetration_m": float(static_contact_diag["total_penetration_m"]),
+        "max_penetration_m": float(static_contact_diag["max_penetration_m"]),
         "source_wrist_error_m": wrist_error,
         "source_palm_error_m": palm_error,
         "source_tip_rmse_m": tip_rmse,
@@ -2435,6 +2370,9 @@ def _evaluate_projected_candidate(
         "source_extra_contacts": extra_contacts,
         "source_matched_target_contacts": matched_target_contacts,
         "required_target_contacts": float(required_contacts),
+        "static_contact_group_count": static_contact_group_count,
+        "static_hard_contact_group_count": static_hard_contact_group_count,
+        "static_has_thumb_opposition": static_has_thumb_opposition,
         "settled_contact_group_count": settled_contact_group_count,
         "settled_hard_contact_group_count": settled_hard_contact_group_count,
         "settled_has_thumb_opposition": settled_has_thumb_opposition,
@@ -2446,9 +2384,9 @@ def _evaluate_projected_candidate(
         "cylinder_opposition_cos": float(cylinder_opposition_cos),
         "object_translation_drift_m": object_translation_drift_m,
         "object_rotation_drift_deg": object_rotation_drift_deg,
-        "settled_total_penetration_m": float(settled_contact_diag["total_penetration_m"]),
-        "settled_max_penetration_m": float(settled_contact_diag["max_penetration_m"]),
-        "hold_table_contact": bool(final_contact_diag["table_contact"]),
+        "settled_total_penetration_m": float(static_contact_diag["total_penetration_m"]),
+        "settled_max_penetration_m": float(static_contact_diag["max_penetration_m"]),
+        "hold_table_contact": hold_table_contact,
         "hold_object_drop_m": hold_object_drop_m,
         "hold_object_translation_m": hold_object_translation_m,
         "hold_object_rotation_deg": hold_object_rotation_deg,
@@ -2458,7 +2396,7 @@ def _evaluate_projected_candidate(
         "hold_has_thumb_opposition": hold_has_thumb_opposition,
         "hold_cylinder_palm_clearance_error_m": float(hold_cylinder_palm_clearance_error_m),
         "hold_cylinder_opposition_cos": float(hold_cylinder_opposition_cos),
-        "hold_tested": bool(run_hold_test),
+        "hold_tested": False,
     }
 
 
@@ -2471,6 +2409,7 @@ def _project_genhand_target(
     source_keypoints_obj: np.ndarray,
     source_contact_mask_12: np.ndarray,
     source_dgrasp_qpos_world: np.ndarray | None,
+    initial_arm_qpos: np.ndarray,
     initial_hand_qpos: np.ndarray,
 ) -> dict[str, Any]:
     base_hand_qpos = runtime.clamp_hand(np.asarray(initial_hand_qpos, dtype=np.float64))
@@ -2496,10 +2435,9 @@ def _project_genhand_target(
     global_best: dict[str, Any] | None = None
     for seed_translation, seed_rotvec, seed_hand_qpos in seed_states:
         candidate: dict[str, Any] | None = None
-        teacher_cost = 1.0e6
-        teacher_failed = 0.0
+        teacher_cost = float("inf")
         try:
-            optimized_translation, optimized_rotvec, optimized_hand_qpos, teacher_cost = _optimize_genhand_seed(
+            optimized_translation, optimized_rotvec, optimized_hand_qpos, optimized_arm_qpos, teacher_cost = _optimize_genhand_seed(
                 runtime=runtime,
                 config=config,
                 object_pose_goal=object_pose_goal,
@@ -2508,6 +2446,7 @@ def _project_genhand_target(
                 source_keypoints_obj=source_keypoints_obj,
                 source_contact_mask_12=source_contact_mask_12,
                 source_dgrasp_qpos_world=source_dgrasp_qpos_world,
+                initial_arm_qpos=initial_arm_qpos,
                 initial_translation_local=seed_translation,
                 initial_rotvec_local=seed_rotvec,
                 initial_hand_qpos=seed_hand_qpos,
@@ -2522,10 +2461,9 @@ def _project_genhand_target(
                 wrist_translation_local=optimized_translation,
                 wrist_rotvec_local=optimized_rotvec,
                 hand_qpos=optimized_hand_qpos,
-                run_hold_test=False,
+                initial_arm_qpos=optimized_arm_qpos,
             )
         except Exception:
-            teacher_failed = 1.0
             try:
                 candidate = _evaluate_projected_candidate(
                     runtime=runtime,
@@ -2537,14 +2475,13 @@ def _project_genhand_target(
                     wrist_translation_local=np.asarray(seed_translation, dtype=np.float64),
                     wrist_rotvec_local=np.asarray(seed_rotvec, dtype=np.float64),
                     hand_qpos=np.asarray(seed_hand_qpos, dtype=np.float64),
-                    run_hold_test=False,
+                    initial_arm_qpos=initial_arm_qpos,
                 )
             except Exception:
                 candidate = None
         if candidate is None:
             continue
         candidate["teacher_cost"] = float(teacher_cost)
-        candidate["genhand_opt_failed"] = float(teacher_failed)
         candidate.update({f"genhand_{k}": float(v) for k, v in source_fc_metrics.items()})
         candidate.update(
             _candidate_contact_anchor_metrics(
@@ -2561,61 +2498,14 @@ def _project_genhand_target(
     if global_best is None:
         raise RuntimeError("GenHand-style retargeting failed to produce a candidate.")
 
-    unique_shortlist: list[dict[str, Any]] = []
-    seen_keys: set[tuple[float, ...]] = set()
-    for candidate in sorted(candidate_pool, key=lambda item: _projection_preshortlist_rank_key(item, required_contacts)):
-        key = tuple(
-            np.round(
-                np.concatenate(
-                    [
-                        np.asarray(candidate["wrist_translation_local"], dtype=np.float64),
-                        np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64),
-                        np.asarray(candidate["hand_qpos"], dtype=np.float64),
-                    ]
-                ),
-                5,
-            ).tolist()
-        )
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        unique_shortlist.append(candidate)
-        if len(unique_shortlist) >= 6:
-            break
-
-    hold_validated_best: dict[str, Any] | None = None
-    for candidate in unique_shortlist:
-        validated = _evaluate_projected_candidate(
-            runtime=runtime,
-            config=config,
-            object_pose_goal=object_pose_goal,
-            source_wrist_pose_world=source_wrist_pose_world,
-            source_semantic_sites_world=source_semantic_sites_world,
-            source_contact_mask_12=source_contact_mask_12,
-            wrist_translation_local=np.asarray(candidate["wrist_translation_local"], dtype=np.float64),
-            wrist_rotvec_local=np.asarray(candidate["wrist_rotvec_local"], dtype=np.float64),
-            hand_qpos=np.asarray(candidate["hand_qpos"], dtype=np.float64),
-            run_hold_test=True,
-        )
-        validated["teacher_cost"] = float(candidate.get("teacher_cost", 0.0))
-        validated["genhand_opt_failed"] = float(candidate.get("genhand_opt_failed", 0.0))
-        for key, value in candidate.items():
-            if isinstance(key, str) and (key.startswith("genhand_") or key.startswith("anchor_")):
-                validated[key] = value
-        if _is_better_projected_candidate(validated, hold_validated_best, required_contacts):
-            hold_validated_best = validated
-
-    if hold_validated_best is None:
-        raise RuntimeError("GenHand-style retargeting failed during hold validation.")
-
-    hold_validated_best["retreat_m"] = float(
-        max(0.0, -float(np.asarray(hold_validated_best["wrist_translation_local"], dtype=np.float64)[2]))
+    global_best["retreat_m"] = float(
+        max(0.0, -float(np.asarray(global_best["wrist_translation_local"], dtype=np.float64)[2]))
     )
-    hold_validated_best["hand_open_blend"] = float(
-        np.linalg.norm(np.asarray(hold_validated_best["hand_qpos"], dtype=np.float64) - base_hand_qpos)
+    global_best["hand_open_blend"] = float(
+        np.linalg.norm(np.asarray(global_best["hand_qpos"], dtype=np.float64) - base_hand_qpos)
         / max(np.linalg.norm(runtime.hand_upper - runtime.hand_lower), 1e-8)
     )
-    return hold_validated_best
+    return global_best
 
 
 def _project_feasible_target(
@@ -2630,7 +2520,6 @@ def _project_feasible_target(
     initial_arm_qpos: np.ndarray,
     initial_hand_qpos: np.ndarray,
 ) -> dict[str, Any]:
-    del initial_arm_qpos
     projected = _project_genhand_target(
         runtime=runtime,
         config=config,
@@ -2640,6 +2529,7 @@ def _project_feasible_target(
         source_keypoints_obj=source_keypoints_obj,
         source_contact_mask_12=source_contact_mask_12,
         source_dgrasp_qpos_world=source_dgrasp_qpos_world,
+        initial_arm_qpos=initial_arm_qpos,
         initial_hand_qpos=initial_hand_qpos,
     )
     projected["retarget_method"] = "genhand_direct"
@@ -2681,12 +2571,13 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
         init_pose[:3] += workspace_translation
 
         source_semantic_sites_obj = mano_semantic_sites_from_keypoints(final_ee_rel[label_idx])
-        source_semantic_sites_world = transform_points(source_semantic_sites_obj, goal_pose)
-        source_wrist_pose_goal_world = wrist_pose_from_semantic_sites(source_semantic_sites_world)
         source_root_pose_world = _source_root_pose_world(final_qpos[label_idx], final_pose[label_idx], workspace_translation)
         source_contact_mask = contact_mask_16_to_12(final_contacts[label_idx])
         source_dgrasp_qpos_world = final_qpos[label_idx].copy()
         source_dgrasp_qpos_world[:3] += workspace_translation
+
+        source_semantic_sites_world = transform_points(source_semantic_sites_obj, goal_pose)
+        source_wrist_pose_goal_world = wrist_pose_from_semantic_sites(source_semantic_sites_world)
         reachability_delta = _compute_reachability_alignment_delta(
             config=config,
             goal_pose=goal_pose,
@@ -2769,9 +2660,12 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "projected_required_target_contacts": float(projected["required_target_contacts"]),
             "projected_hard_contact_count": float(np.sum(np.asarray(projected["physical_contact_mask_12"], dtype=np.float64) > 0.5)),
             "projected_hybrid_contact_count": float(np.sum(np.asarray(projected["contact_mask_12"], dtype=np.float64) > 0.5)),
-            "projected_contact_group_count": float(projected["settled_contact_group_count"]),
-            "projected_hard_contact_group_count": float(projected["settled_hard_contact_group_count"]),
-            "projected_has_thumb_opposition": float(bool(projected["settled_has_thumb_opposition"])),
+            "projected_contact_group_count": float(projected["static_contact_group_count"]),
+            "projected_hard_contact_group_count": float(projected["static_hard_contact_group_count"]),
+            "projected_has_thumb_opposition": float(bool(projected["static_has_thumb_opposition"])),
+            "projected_settled_contact_group_count": float(projected["settled_contact_group_count"]),
+            "projected_settled_hard_contact_group_count": float(projected["settled_hard_contact_group_count"]),
+            "projected_settled_has_thumb_opposition": float(bool(projected["settled_has_thumb_opposition"])),
             "projected_reach_object_facing_cos": float(projected["reach_object_facing_cos"]),
             "projected_reach_base_facing_cos": float(projected["reach_base_facing_cos"]),
             "projected_reach_downward_component": float(projected["reach_downward_component"]),
@@ -2792,6 +2686,7 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "projected_hold_hybrid_contact_group_count": float(projected["hold_hybrid_contact_group_count"]),
             "projected_hold_hard_contact_group_count": float(projected["hold_hard_contact_group_count"]),
             "projected_hold_has_thumb_opposition": float(bool(projected["hold_has_thumb_opposition"])),
+            "projected_hold_tested": float(bool(projected.get("hold_tested", False))),
             "projected_hold_cylinder_palm_clearance_error_m": float(projected["hold_cylinder_palm_clearance_error_m"]),
             "projected_hold_cylinder_opposition_cos": float(projected["hold_cylinder_opposition_cos"]),
             "projected_hold_matched_target_contacts": float(projected["hold_matched_target_contacts"]),
@@ -2804,38 +2699,26 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
             "genhand_fc_net_wrench": float(anchor_metrics.get("genhand_fc_net_wrench", projected.get("genhand_fc_net_wrench", 0.0))),
             "genhand_fc_lin_ind": float(anchor_metrics.get("genhand_fc_lin_ind", projected.get("genhand_fc_lin_ind", 0.0))),
             "genhand_fc_intfc": float(anchor_metrics.get("genhand_fc_intfc", projected.get("genhand_fc_intfc", 0.0))),
-            "genhand_fc_mu": float(anchor_metrics.get("genhand_fc_mu", projected.get("genhand_fc_mu", GENHAND_FC_MU))),
             "genhand_cluster_candidate_count": float(anchor_metrics.get("genhand_cluster_candidate_count", projected.get("genhand_cluster_candidate_count", 0.0))),
             "genhand_cluster_score_mean": float(anchor_metrics.get("genhand_cluster_score_mean", projected.get("genhand_cluster_score_mean", 0.0))),
             "genhand_target_anchor_rmse_m": float(anchor_metrics.get("genhand_target_anchor_rmse_m", projected.get("genhand_target_anchor_rmse_m", 0.0))),
             "projection_score": float(projected["score"]),
             "retarget_method": str(projected.get("retarget_method", "genhand_direct")),
-            "surface_query_backend": _object_surface_backend_name(config),
             "teacher_cost": float(projected.get("teacher_cost", 0.0)),
             "optimizer_cost": optimizer_cost,
         }
         source_tip_threshold = 0.12 if config.object_geom_type == "cylinder" else 0.085
         object_translation_threshold = 0.12 if config.object_geom_type == "cylinder" else PROJECTION_HARD_OBJECT_TRANSLATION_DRIFT_M
         object_rotation_threshold = 45.0 if config.object_geom_type == "cylinder" else PROJECTION_HARD_OBJECT_ROTATION_DRIFT_DEG
-        hold_drop_threshold = 0.08 if config.object_geom_type == "cylinder" else PROJECTION_HOLD_MAX_DROP_M
-        hold_translation_threshold = 0.10 if config.object_geom_type == "cylinder" else PROJECTION_HOLD_MAX_TRANSLATION_M
-        hold_rotation_threshold = 35.0 if config.object_geom_type == "cylinder" else PROJECTION_HOLD_MAX_ROTATION_DEG
         valid_execution = bool(
             fit_error["projected_max_penetration_m"] <= PROJECTION_HARD_MAX_PENETRATION_M
             and fit_error["source_tip_rmse_m"] <= source_tip_threshold
             and fit_error["projected_object_translation_drift_m"] <= object_translation_threshold
             and fit_error["projected_object_rotation_drift_deg"] <= object_rotation_threshold
             and not bool(projected["table_contact"])
-            and fit_error["projected_hold_object_drop_m"] <= hold_drop_threshold
-            and fit_error["projected_hold_object_translation_m"] <= hold_translation_threshold
-            and fit_error["projected_hold_object_rotation_deg"] <= hold_rotation_threshold
-            and not bool(projected["hold_table_contact"])
-            and fit_error["projected_hold_hybrid_contact_group_count"] >= 2.0
-            and fit_error["projected_hold_hard_contact_group_count"] >= 1.0
-            and bool(projected["hold_has_thumb_opposition"])
             and fit_error["projected_contact_group_count"] >= 2.0
             and fit_error["projected_hard_contact_group_count"] >= 1.0
-            and bool(projected["settled_has_thumb_opposition"])
+            and bool(projected["static_has_thumb_opposition"])
             and fit_error["projected_reach_object_facing_cos"] >= REACHABILITY_MIN_OBJECT_FACING_COS
             and fit_error["projected_reach_base_facing_cos"] <= REACHABILITY_MAX_BASE_FACING_COS
             and fit_error["projected_reach_downward_component"] >= REACHABILITY_MIN_DOWNWARD_APPROACH
@@ -2845,8 +2728,6 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
                 or (
                     fit_error["projected_cylinder_palm_clearance_error_m"] <= 0.018
                     and fit_error["projected_cylinder_opposition_cos"] <= -0.05
-                    and fit_error["projected_hold_cylinder_palm_clearance_error_m"] <= 0.022
-                    and fit_error["projected_hold_cylinder_opposition_cos"] <= 0.05
                 )
             )
         )
@@ -2886,9 +2767,10 @@ def prepare_pose_driven_samples(config: TaskConfig, force_rebuild: bool = False)
                 "projected_hold_hybrid_contact_group_count": float(projected["hold_hybrid_contact_group_count"]),
                 "projected_hold_hard_contact_group_count": float(projected["hold_hard_contact_group_count"]),
                 "projected_hold_has_thumb_opposition": bool(projected["hold_has_thumb_opposition"]),
-                "projected_contact_group_count": float(projected["settled_contact_group_count"]),
-                "projected_hard_contact_group_count": float(projected["settled_hard_contact_group_count"]),
-                "projected_has_thumb_opposition": bool(projected["settled_has_thumb_opposition"]),
+                "projected_hold_tested": bool(projected.get("hold_tested", False)),
+                "projected_contact_group_count": float(projected["static_contact_group_count"]),
+                "projected_hard_contact_group_count": float(projected["static_hard_contact_group_count"]),
+                "projected_has_thumb_opposition": bool(projected["static_has_thumb_opposition"]),
                 "projected_reach_object_facing_cos": float(projected["reach_object_facing_cos"]),
                 "projected_reach_base_facing_cos": float(projected["reach_base_facing_cos"]),
                 "projected_reach_downward_component": float(projected["reach_downward_component"]),
