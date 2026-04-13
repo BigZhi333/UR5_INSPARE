@@ -19,6 +19,7 @@ from fr5_rh56e2_dgrasp_rl.robot_model import RobotSceneModel
 from fr5_rh56e2_dgrasp_rl.scene_builder import build_training_scene
 from fr5_rh56e2_dgrasp_rl.semantics import SEMANTIC_CONTACT_NAMES
 from fr5_rh56e2_dgrasp_rl.task_config import TaskConfig
+from fr5_rh56e2_dgrasp_rl.utils import compose_pose7, transform_points
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -36,12 +37,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _sample_wrist_goal_world(sample: PoseDrivenSample) -> np.ndarray:
+    return compose_pose7(
+        np.asarray(sample.object_pose_goal, dtype=np.float64),
+        np.asarray(sample.wrist_pose_goal_object, dtype=np.float64),
+    )
+
+
+def _sample_sites_goal_world(sample: PoseDrivenSample) -> np.ndarray:
+    return transform_points(
+        sample.semantic_sites_object(),
+        np.asarray(sample.object_pose_goal, dtype=np.float64),
+    )
+
+
 def _solve_final_actuated_qpos(runtime: RobotSceneModel, config: TaskConfig, sample: PoseDrivenSample) -> np.ndarray:
     runtime.reset()
     runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
     arm_qpos = solve_arm_wrist_palm_ik(
         runtime=runtime,
-        target_wrist_pose_world=np.asarray(sample.wrist_pose_goal_world, dtype=np.float64),
+        target_wrist_pose_world=_sample_wrist_goal_world(sample),
         initial_arm_qpos=runtime.get_actuated_qpos()[:6],
         hand_qpos=np.asarray(sample.hand_qpos_6, dtype=np.float64),
         iterations=config.conversion.arm_ik_iterations,
@@ -89,7 +104,7 @@ def analyze_pose_driven_consistency(
         runtime.set_object_pose(np.asarray(sample.object_pose_goal, dtype=np.float64))
         runtime.set_robot_actuated_qpos(final_actuated_qpos)
         current_sites = runtime.get_semantic_sites_world()
-        target_sites = sample.semantic_sites_world()
+        target_sites = _sample_sites_goal_world(sample)
         site_distances = np.linalg.norm(current_sites - target_sites, axis=1)
 
         wrist_error = float(site_distances[0])

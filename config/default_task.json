@@ -99,6 +99,8 @@
     "arm_ik_iterations": 120,
     "arm_ik_damping": 0.0005,
     "finger_opt_max_nfev": 80,
-    "joint_opt_max_nfev": 100
+    "joint_opt_max_nfev": 100,
+    "candidate_screening_mode": "settle",
+    "saved_target_mode": "settled_anchored"
   }
 }

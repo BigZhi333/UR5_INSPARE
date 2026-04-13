@@ -43,6 +43,8 @@ class ConversionConfig:
     arm_ik_damping: float
     finger_opt_max_nfev: int
     joint_opt_max_nfev: int
+    candidate_screening_mode: str
+    saved_target_mode: str
 
 
 @dataclass
@@ -108,6 +110,9 @@ class TaskConfig:
     def from_json(cls, path: Path) -> "TaskConfig":
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload.setdefault("object_geom_type", "box")
+        payload.setdefault("conversion", {})
+        payload["conversion"].setdefault("candidate_screening_mode", "settle")
+        payload["conversion"].setdefault("saved_target_mode", "settled_anchored")
         payload["ppo"] = PPOConfig(**payload["ppo"])
         payload["eval"] = EvalConfig(**payload["eval"])
         payload["conversion"] = ConversionConfig(**payload["conversion"])

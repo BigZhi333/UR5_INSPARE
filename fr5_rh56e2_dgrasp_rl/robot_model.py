@@ -191,15 +191,22 @@ class RobotSceneModel:
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = self.home_ctrl
         self.data.qfrc_applied[:] = 0.0
-        self.set_arm_hold_mode(False)
+        self.set_position_control_stiffness(1.0, 1.0)
         self.set_table_height(self.original_table_center_z)
         mujoco.mj_forward(self.model, self.data)
 
+    def set_position_control_stiffness(self, arm_kp_scale: float = 1.0, hand_kp_scale: float = 1.0) -> None:
+        arm_count = len(self.arm_joints)
+        actuator_count = len(self.actuated_joints)
+        scales = np.ones(actuator_count, dtype=np.float64)
+        scales[:arm_count] = float(arm_kp_scale)
+        scales[arm_count:] = float(hand_kp_scale)
+        self.model.actuator_gainprm[:actuator_count, 0] = self.default_actuator_kp[:actuator_count] * scales
+        self.model.actuator_biasprm[:actuator_count, 1] = -self.default_actuator_bias_kp[:actuator_count] * scales
+
     def set_arm_hold_mode(self, enabled: bool, arm_kp_scale: float = 1.0) -> None:
         scale = float(arm_kp_scale if enabled else 1.0)
-        arm_count = len(self.arm_joints)
-        self.model.actuator_gainprm[:arm_count, 0] = self.default_actuator_kp[:arm_count] * scale
-        self.model.actuator_biasprm[:arm_count, 1] = -self.default_actuator_kp[:arm_count] * scale
+        self.set_position_control_stiffness(arm_kp_scale=scale, hand_kp_scale=1.0)
 
     def _arm_support_torque(self, force_world: np.ndarray) -> np.ndarray:
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
@@ -288,6 +295,13 @@ class RobotSceneModel:
         self.data.qpos[self.object_qpos_adr : self.object_qpos_adr + 7] = pose
         self.data.qvel[self.object_qvel_adr : self.object_qvel_adr + 6] = 0.0
         mujoco.mj_forward(self.model, self.data)
+
+    def pin_object_pose(self, pose: np.ndarray, forward: bool = True) -> None:
+        pose = np.asarray(pose, dtype=np.float64)
+        self.data.qpos[self.object_qpos_adr : self.object_qpos_adr + 7] = pose
+        self.data.qvel[self.object_qvel_adr : self.object_qvel_adr + 6] = 0.0
+        if forward:
+            mujoco.mj_forward(self.model, self.data)
 
     def get_object_pose(self) -> np.ndarray:
         return self.data.qpos[self.object_qpos_adr : self.object_qpos_adr + 7].copy()
@@ -442,7 +456,13 @@ class RobotSceneModel:
         self.model.geom_pos[self.table_geom_id, 2] = center_z
         mujoco.mj_forward(self.model, self.data)
 
-    def step(self, ctrl: np.ndarray, frame_skip: int, arm_support_force_world: np.ndarray | None = None) -> None:
+    def step(
+        self,
+        ctrl: np.ndarray,
+        frame_skip: int,
+        arm_support_force_world: np.ndarray | None = None,
+        fixed_object_pose: np.ndarray | None = None,
+    ) -> None:
         self.data.ctrl[:] = self.clamp_actuated(np.asarray(ctrl, dtype=np.float64))
         support_torque = None
         if arm_support_force_world is not None:
@@ -452,13 +472,31 @@ class RobotSceneModel:
             if support_torque is not None:
                 self.data.qfrc_applied[:] = support_torque
             mujoco.mj_step(self.model, self.data)
+            if fixed_object_pose is not None:
+                self.pin_object_pose(fixed_object_pose, forward=True)
         self.data.qfrc_applied[:] = 0.0
 
-    def settle_actuated_pose(self, actuated_qpos: np.ndarray, settle_steps: int) -> None:
+    def settle_actuated_pose(
+        self,
+        actuated_qpos: np.ndarray,
+        settle_steps: int,
+        fixed_object_pose: np.ndarray | None = None,
+        arm_kp_scale: float = 1.0,
+        hand_kp_scale: float = 1.0,
+    ) -> None:
         actuated_qpos = self.clamp_actuated(np.asarray(actuated_qpos, dtype=np.float64))
-        self.set_robot_actuated_qpos(actuated_qpos, update_ctrl=True)
-        for _ in range(max(0, int(settle_steps))):
-            mujoco.mj_step(self.model, self.data)
+        self.set_position_control_stiffness(
+            arm_kp_scale=float(arm_kp_scale),
+            hand_kp_scale=float(hand_kp_scale),
+        )
+        try:
+            self.set_robot_actuated_qpos(actuated_qpos, update_ctrl=True)
+            if fixed_object_pose is not None:
+                self.pin_object_pose(fixed_object_pose, forward=True)
+            for _ in range(max(0, int(settle_steps))):
+                self.step(actuated_qpos, 1, fixed_object_pose=fixed_object_pose)
+        finally:
+            self.set_position_control_stiffness(1.0, 1.0)
 
     def _collect_object_contacts(
         self,
