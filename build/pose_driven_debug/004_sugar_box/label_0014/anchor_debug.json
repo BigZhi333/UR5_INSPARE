@@ -1,0 +1,22 @@
+{
+  "label_idx": 14,
+  "object_pose_goal": [
+    0.7700591850280761,
+    -0.6927640406001865,
+    0.5604214954376221,
+    0.2810726761817932,
+    0.5948630571365356,
+    -0.40710729360580444,
+    0.6335611343383789
+  ],
+  "candidate_points_obj": [],
+  "candidate_normals_obj": [],
+  "candidate_scores": [],
+  "clustered_targets_obj": [],
+  "optimized_targets_obj": [],
+  "optimized_normals_obj": [],
+  "build_failed": true,
+  "fc_metrics": {
+    "build_failed": 1.0
+  }
+}

@@ -1,0 +1,274 @@
+{
+  "scene_xml": "E:\\A_mujoco\\UR5_INSPARE\\build\\fr5_rh56e2_004_sugar_box_scene.xml",
+  "movable_joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6",
+    "rh56e2_right_thumb_1_joint",
+    "rh56e2_right_thumb_2_joint",
+    "rh56e2_right_thumb_3_joint",
+    "rh56e2_right_thumb_4_joint",
+    "rh56e2_right_index_1_joint",
+    "rh56e2_right_index_2_joint",
+    "rh56e2_right_middle_1_joint",
+    "rh56e2_right_middle_2_joint",
+    "rh56e2_right_ring_1_joint",
+    "rh56e2_right_ring_2_joint",
+    "rh56e2_right_little_1_joint",
+    "rh56e2_right_little_2_joint"
+  ],
+  "joint_limits": {
+    "j1": [
+      -3.0543,
+      3.0543
+    ],
+    "j2": [
+      -4.6251,
+      1.4835
+    ],
+    "j3": [
+      -2.8274,
+      2.8274
+    ],
+    "j4": [
+      -4.6251,
+      1.4835
+    ],
+    "j5": [
+      -3.0543,
+      3.0543
+    ],
+    "j6": [
+      -3.0543,
+      3.0543
+    ],
+    "rh56e2_right_thumb_1_joint": [
+      0.0,
+      1.658
+    ],
+    "rh56e2_right_thumb_2_joint": [
+      0.0,
+      0.62
+    ],
+    "rh56e2_right_thumb_3_joint": [
+      0.0,
+      0.5410520681182421
+    ],
+    "rh56e2_right_thumb_4_joint": [
+      0.0,
+      0.45553093477052004
+    ],
+    "rh56e2_right_index_1_joint": [
+      0.0,
+      1.4381
+    ],
+    "rh56e2_right_index_2_joint": [
+      0.0,
+      1.476374
+    ],
+    "rh56e2_right_middle_1_joint": [
+      0.0,
+      1.4381
+    ],
+    "rh56e2_right_middle_2_joint": [
+      0.0,
+      1.476374
+    ],
+    "rh56e2_right_ring_1_joint": [
+      0.0,
+      1.4381
+    ],
+    "rh56e2_right_ring_2_joint": [
+      0.0,
+      1.476374
+    ],
+    "rh56e2_right_little_1_joint": [
+      0.0,
+      1.4381
+    ],
+    "rh56e2_right_little_2_joint": [
+      0.0,
+      1.476374
+    ]
+  },
+  "mimics": [
+    {
+      "joint": "rh56e2_right_thumb_3_joint",
+      "master": "rh56e2_right_thumb_2_joint",
+      "multiplier": 0.8392,
+      "offset": 0.0
+    },
+    {
+      "joint": "rh56e2_right_thumb_4_joint",
+      "master": "rh56e2_right_thumb_3_joint",
+      "multiplier": 0.891,
+      "offset": 0.0
+    },
+    {
+      "joint": "rh56e2_right_index_2_joint",
+      "master": "rh56e2_right_index_1_joint",
+      "multiplier": 1.0843,
+      "offset": 0.0
+    },
+    {
+      "joint": "rh56e2_right_middle_2_joint",
+      "master": "rh56e2_right_middle_1_joint",
+      "multiplier": 1.0843,
+      "offset": 0.0
+    },
+    {
+      "joint": "rh56e2_right_ring_2_joint",
+      "master": "rh56e2_right_ring_1_joint",
+      "multiplier": 1.0843,
+      "offset": 0.0
+    },
+    {
+      "joint": "rh56e2_right_little_2_joint",
+      "master": "rh56e2_right_little_1_joint",
+      "multiplier": 1.0843,
+      "offset": 0.0
+    }
+  ],
+  "arm_joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6"
+  ],
+  "hand_joints": [
+    "rh56e2_right_thumb_1_joint",
+    "rh56e2_right_thumb_2_joint",
+    "rh56e2_right_index_1_joint",
+    "rh56e2_right_middle_1_joint",
+    "rh56e2_right_ring_1_joint",
+    "rh56e2_right_little_1_joint"
+  ],
+  "actuated_joints": [
+    "j1",
+    "j2",
+    "j3",
+    "j4",
+    "j5",
+    "j6",
+    "rh56e2_right_thumb_1_joint",
+    "rh56e2_right_thumb_2_joint",
+    "rh56e2_right_index_1_joint",
+    "rh56e2_right_middle_1_joint",
+    "rh56e2_right_ring_1_joint",
+    "rh56e2_right_little_1_joint"
+  ],
+  "home_qpos": [
+    -1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    1.5707963267948966,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "home_ctrl": [
+    -1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    -1.5707963267948966,
+    1.5707963267948966,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "closed_hand_ctrl": [
+    0.5802999999999999,
+    0.5084,
+    1.179242,
+    1.179242,
+    1.179242,
+    1.179242
+  ],
+  "scene_build_version": 7,
+  "scene_metadata": "E:\\A_mujoco\\UR5_INSPARE\\build\\fr5_rh56e2_004_sugar_box_metadata.json",
+  "semantic_sites": [
+    "wrist_mount",
+    "palm_center",
+    "thumb_tip",
+    "index_tip",
+    "middle_tip",
+    "ring_tip",
+    "little_tip"
+  ],
+  "object_body_name": "task_object",
+  "object_joint_name": "task_object_freejoint",
+  "object_center_site": "task_object_center",
+  "table_geom_name": "grasp_table",
+  "table_center": [
+    0.68,
+    -0.32,
+    0.25
+  ],
+  "table_size": [
+    0.62,
+    0.85,
+    0.25
+  ],
+  "object_dims_m": [
+    0.038,
+    0.089,
+    0.175
+  ],
+  "object_geom_type": "box",
+  "default_object_pose": [
+    0.74,
+    -0.64,
+    0.5875,
+    1.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "contact_group_bodies": {
+    "palm": [
+      "j6_Link"
+    ],
+    "thumb": [
+      "rh56e2_right_thumb_1",
+      "rh56e2_right_thumb_2",
+      "rh56e2_right_thumb_3",
+      "rh56e2_right_thumb_4"
+    ],
+    "index": [
+      "rh56e2_right_index_1",
+      "rh56e2_right_index_2"
+    ],
+    "middle": [
+      "rh56e2_right_middle_1",
+      "rh56e2_right_middle_2"
+    ],
+    "ring": [
+      "rh56e2_right_ring_1",
+      "rh56e2_right_ring_2"
+    ],
+    "little": [
+      "rh56e2_right_little_1",
+      "rh56e2_right_little_2"
+    ]
+  }
+}
